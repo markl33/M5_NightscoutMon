@@ -271,6 +271,7 @@ void setup() {
     // cfg.snd_alarm = 4.5;
     // cfg.alarm_repeat = 1;
     // cfg.snooze_timeout = 2;
+    // cfg.brightness1 = 0;
     
     lcdBrightness = cfg.brightness1;
     M5.Lcd.setBrightness(lcdBrightness);
