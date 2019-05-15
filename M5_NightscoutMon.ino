@@ -191,8 +191,8 @@ void buttons_test() {
   if(M5.BtnC.wasPressed()) {
       // M5.Lcd.printf("C");
       Serial.printf("C");
-      // M5.setWakeupButton(BUTTON_B_PIN);
-      // M5.powerOFF();
+      M5.setWakeupButton(BUTTON_B_PIN);
+      M5.powerOFF();
 
       /*
       for (int i=0;i<25000;i++) {
