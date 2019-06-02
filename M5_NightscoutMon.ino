@@ -17,6 +17,7 @@
     This software uses some 3rd party libraries:
     IniFile by Steve Marple <stevemarple@googlemail.com> (GNU LGPL v2.1)
     ArduinoJson by Benoit BLANCHON (MIT License) 
+    IoT Icon Set by Artur Funk (GPL v3)
 */
 
 #include <M5Stack.h>
@@ -38,9 +39,22 @@ extern const unsigned char m5stack_startup_music[];
 extern const unsigned char WiFi_symbol[];
 extern const unsigned char alarmSndData[];
 
+extern const unsigned char sun_icon16x16[];
+extern const unsigned char clock_icon16x16[];
+extern const unsigned char timer_icon16x16[];
+extern const unsigned char powerbutton_icon16x16[];
+
+extern const unsigned char bat0_icon16x16[];
+extern const unsigned char bat1_icon16x16[];
+extern const unsigned char bat2_icon16x16[];
+extern const unsigned char bat3_icon16x16[];
+extern const unsigned char bat4_icon16x16[];
+extern const unsigned char plug_icon16x16[];
+
 const char* ntpServer = "pool.ntp.org";
 struct tm localTimeInfo;
 int lastSec = 61;
+int lastMin = 61;
 char localTimeStr[30];
 
 #ifndef min
@@ -101,6 +115,8 @@ void play_music_data(uint32_t data_length, uint8_t volume) {
   else
     vol=101-volume;
   if(vol != 101) {
+    ledcAttachPin(SPEAKER_PIN, TONE_PIN_CHANNEL);
+    delay(10);
     for(int i=0; i<data_length; i++) {
       dacWrite(SPEAKER_PIN, music_data[i]/vol);
       delayMicroseconds(200); // 1 000 000 microseconds / sample rate 5000
@@ -112,8 +128,9 @@ void play_music_data(uint32_t data_length, uint8_t volume) {
       delay(2);
     } */
     dacWrite(SPEAKER_PIN, 0);
+    delay(10);
+    ledcDetachPin(SPEAKER_PIN);
   }
-  ledcAttachPin(SPEAKER_PIN, TONE_PIN_CHANNEL);
 }
 
 void play_tone(uint16_t frequency, uint32_t duration, uint8_t volume) {
@@ -134,7 +151,7 @@ void sndAlarm() {
       if( cfg.dev_mode )
         play_tone(660, 400, 1);
       else
-        play_tone(660, 400, 20);
+        play_tone(660, 400, cfg.alarm_volume);
       delay(200);
     }
     M5.Speaker.mute();
@@ -147,7 +164,7 @@ void sndWarning() {
     if( cfg.dev_mode )
       play_tone(3000, 100, 1);
     else
-      play_tone(3000, 100, 100);
+      play_tone(3000, 100, cfg.warning_volume);
     delay(300);
   }
   M5.Speaker.mute();
@@ -158,6 +175,7 @@ void buttons_test() {
   if(M5.BtnA.wasPressed()) {
       // M5.Lcd.printf("A");
       Serial.printf("A");
+      // play_tone(1000, 10, 1);
       // sndAlarm();
       if(lcdBrightness==cfg.brightness1) 
         lcdBrightness = cfg.brightness2;
@@ -171,7 +189,7 @@ void buttons_test() {
   if(M5.BtnB.wasPressed()) {
       // M5.Lcd.printf("B");
       Serial.printf("B");
-
+      // play_tone(1000, 10, 1);
       struct tm timeinfo;
       if(!getLocalTime(&timeinfo)){
         lastSnoozeTime=0;
@@ -191,6 +209,7 @@ void buttons_test() {
   if(M5.BtnC.wasPressed()) {
       // M5.Lcd.printf("C");
       Serial.printf("C");
+      // play_tone(1000, 10, 1);
       M5.setWakeupButton(BUTTON_B_PIN);
       M5.powerOFF();
 
@@ -203,47 +222,80 @@ void buttons_test() {
 }
 
 void wifi_connect() {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
 
-    Serial.println("WiFi connect start");
-    M5.Lcd.println("WiFi connect start");
+  Serial.println("WiFi connect start");
+  M5.Lcd.println("WiFi connect start");
 
-    // We start by connecting to a WiFi network
-    if(cfg.wlan1ssid[0]!=0)
-      WiFiMulti.addAP(cfg.wlan1ssid, cfg.wlan1pass);
-    if(cfg.wlan2ssid[0]!=0)
-      WiFiMulti.addAP(cfg.wlan2ssid, cfg.wlan2pass);
-    if(cfg.wlan3ssid[0]!=0)
-      WiFiMulti.addAP(cfg.wlan3ssid, cfg.wlan3pass);
+  // We start by connecting to a WiFi network
+  if(cfg.wlan1ssid[0]!=0)
+    WiFiMulti.addAP(cfg.wlan1ssid, cfg.wlan1pass);
+  if(cfg.wlan2ssid[0]!=0)
+    WiFiMulti.addAP(cfg.wlan2ssid, cfg.wlan2pass);
+  if(cfg.wlan3ssid[0]!=0)
+    WiFiMulti.addAP(cfg.wlan3ssid, cfg.wlan3pass);
 
-    Serial.println();
-    M5.Lcd.println("");
-    Serial.print("Wait for WiFi... ");
-    M5.Lcd.print("Wait for WiFi... ");
+  Serial.println();
+  M5.Lcd.println("");
+  Serial.print("Wait for WiFi... ");
+  M5.Lcd.print("Wait for WiFi... ");
 
-    while(WiFiMulti.run() != WL_CONNECTED) {
-        Serial.print(".");
-        M5.Lcd.print(".");
-        delay(500);
+  while(WiFiMulti.run() != WL_CONNECTED) {
+      Serial.print(".");
+      M5.Lcd.print(".");
+      delay(500);
+  }
+
+  Serial.println("");
+  M5.Lcd.println("");
+  Serial.println("WiFi connected");
+  M5.Lcd.println("WiFi connected");
+  Serial.println("IP address: ");
+  M5.Lcd.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  M5.Lcd.println(WiFi.localIP());
+
+  configTime(cfg.timeZone, cfg.dst, ntpServer);
+  delay(1000);
+  printLocalTime();
+
+  Serial.println("Connection done");
+  M5.Lcd.println("Connection done");
+}
+
+int8_t getBatteryLevel()
+{
+  Wire.beginTransmission(0x75);
+  Wire.write(0x78);
+  if (Wire.endTransmission(false) == 0
+   && Wire.requestFrom(0x75, 1)) {
+    int8_t bdata=Wire.read();
+    /* 
+    // write battery info to logfile.txt
+    File fileLog = SD.open("/logfile.txt", FILE_WRITE);    
+    if(!fileLog) {
+      Serial.println("Cannot write to logfile.txt");
+    } else {
+      int pos = fileLog.seek(fileLog.size());
+      struct tm timeinfo;
+      getLocalTime(&timeinfo);
+      fileLog.print(asctime(&timeinfo));
+      fileLog.print("   Battery level: "); fileLog.println(bdata, HEX);
+      fileLog.close();
+      Serial.print("Log file written: "); Serial.print(asctime(&timeinfo));
     }
-
-    Serial.println("");
-    M5.Lcd.println("");
-    Serial.println("WiFi connected");
-    M5.Lcd.println("WiFi connected");
-    Serial.println("IP address: ");
-    M5.Lcd.println("IP address: ");
-    Serial.println(WiFi.localIP());
-    M5.Lcd.println(WiFi.localIP());
-
-    configTime(cfg.timeZone, cfg.dst, ntpServer);
-    delay(1000);
-    printLocalTime();
-
-    Serial.println("Connection done");
-    M5.Lcd.println("Connection done");
+    */
+    switch (bdata & 0xF0) {
+      case 0xE0: return 25;
+      case 0xC0: return 50;
+      case 0x80: return 75;
+      case 0x00: return 100;
+      default: return 0;
+    }
+  }
+  return -1;
 }
 
 // the setup routine runs once when M5Stack starts up
@@ -267,11 +319,20 @@ void setup() {
     Serial.println(ESP.getFreeHeap());
 
     readConfiguration(iniFilename, &cfg);
+    // strcpy(cfg.url, "user.herokuapp.com");
+    // cfg.show_mgdl = 1;
+    // cfg.show_COB_IOB = 0;
     // cfg.snd_warning = 5.5;
     // cfg.snd_alarm = 4.5;
+    // cfg.snd_warning_high = 9;
+    // cfg.snd_alarm_high = 14;
+    // cfg.alarm_volume = 0;
+    // cfg.warning_volume = 0;
+    
     // cfg.alarm_repeat = 1;
     // cfg.snooze_timeout = 2;
     // cfg.brightness1 = 0;
+    // cfg.info_line = 1;
     
     lcdBrightness = cfg.brightness1;
     M5.Lcd.setBrightness(lcdBrightness);
@@ -366,7 +427,23 @@ void drawMiniGraph(){
   }
   Serial.println();
 }
+void drawIcon(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t color) {
+  int16_t w = 16;
+  int16_t h = 16; 
+  int32_t i, j, byteWidth = (w + 7) / 8;
+  for (j = 0; j < h; j++) {
+    for (i = 0; i < w; i++) {
+      if (pgm_read_byte(bitmap + j * byteWidth + i / 8) & (128 >> (i & 7))) {
+        M5.Lcd.drawPixel(x + i, y + j, color);
+      }
+    }
+  }
+}
+
 void update_glycemia() {
+  char loopInfoStr[64];
+  char basalInfoStr[64];
+  
   M5.Lcd.setTextDatum(TL_DATUM);
   M5.Lcd.setTextColor(WHITE, BLACK);
   M5.Lcd.setTextSize(1);
@@ -477,14 +554,43 @@ void update_glycemia() {
           struct tm timeinfo;
           if(cfg.show_current_time) {
             if(getLocalTime(&timeinfo)) {
-              sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday, timeinfo.tm_mon+1);  
+              // sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday, timeinfo.tm_mon+1);  
+              sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mday, timeinfo.tm_mon+1);  
             } else {
-              strcpy(datetimeStr, "??:??:??");
+              // strcpy(datetimeStr, "??:??:??");
+              strcpy(datetimeStr, "??:??");
             }
           } else {
-            sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", sensTm.tm_hour, sensTm.tm_min, sensTm.tm_sec, sensTm.tm_mday, sensTm.tm_mon+1);
+            // sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", sensTm.tm_hour, sensTm.tm_min, sensTm.tm_sec, sensTm.tm_mday, sensTm.tm_mon+1);
+            sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", sensTm.tm_hour, sensTm.tm_min, sensTm.tm_mday, sensTm.tm_mon+1);
           }
           M5.Lcd.drawString(datetimeStr, 0, 0, GFXFF);
+
+          // draw battery status
+          int8_t battLevel = getBatteryLevel();
+          Serial.print("Battery level: "); Serial.println(battLevel);
+          // sprintf(tmpstr, "%d", battLevel);
+          // M5.Lcd.drawString(tmpstr, 0, 220, GFXFF);
+          M5.Lcd.fillRect(168, 0, 16, 17, TFT_BLACK);
+          if(battLevel!=-1) {
+            switch(battLevel) {
+              case 0:
+                drawIcon(168, 1, (uint8_t*)bat0_icon16x16, TFT_RED);
+                break;
+              case 25:
+                drawIcon(168, 1, (uint8_t*)bat1_icon16x16, TFT_YELLOW);
+                break;
+              case 50:
+                drawIcon(168, 1, (uint8_t*)bat2_icon16x16, TFT_WHITE);
+                break;
+              case 75:
+                drawIcon(168, 1, (uint8_t*)bat3_icon16x16, TFT_LIGHTGREY);
+                break;
+              case 100:
+                drawIcon(168, 0, (uint8_t*)plug_icon16x16, TFT_LIGHTGREY);
+                break;
+            }
+          }
 
           M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
           M5.Lcd.drawString(cfg.userName, 0, 24, GFXFF);
@@ -512,7 +618,7 @@ void update_glycemia() {
           
           strcpy(NSurl,"https://");
           strcat(NSurl,cfg.url);
-          strcat(NSurl,"/api/v2/properties/iob,cob,delta");
+          strcat(NSurl,"/api/v2/properties/iob,cob,delta,loop,basal");
           http.begin(NSurl); //HTTP
           Serial.print("[HTTP] GET properties...\n");
           int httpCode = http.GET();
@@ -521,8 +627,9 @@ void update_glycemia() {
             if(httpCode == HTTP_CODE_OK) {
               // const char* propjson = "{\"iob\":{\"iob\":0,\"activity\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"display\":\"0\",\"displayLine\":\"IOB: 0U\"},\"cob\":{\"cob\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"treatmentCOB\":{\"decayedBy\":\"2019-05-11T23:05:00.000Z\",\"isDecaying\":0,\"carbs_hr\":20,\"rawCarbImpact\":0,\"cob\":7,\"lastCarbs\":{\"_id\":\"5cd74c26156712edb4b32455\",\"enteredBy\":\"Martin\",\"eventType\":\"Carb Correction\",\"reason\":\"\",\"carbs\":7,\"duration\":0,\"created_at\":\"2019-05-11T22:24:00.000Z\",\"mills\":1557613440000,\"mgdl\":67}},\"display\":0,\"displayLine\":\"COB: 0g\"},\"delta\":{\"absolute\":-4,\"elapsedMins\":4.999483333333333,\"interpolated\":false,\"mean5MinsAgo\":69,\"mgdl\":-4,\"scaled\":-0.2,\"display\":\"-0.2\",\"previous\":{\"mean\":69,\"last\":69,\"mills\":1557613221946,\"sgvs\":[{\"mgdl\":69,\"mills\":1557613221946,\"device\":\"MIAOMIAO\",\"direction\":\"Flat\",\"filtered\":92588,\"unfiltered\":92588,\"noise\":1,\"rssi\":100}]}}}";
               String propjson = http.getString();
-              const size_t propcapacity = JSON_ARRAY_SIZE(2) + JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(4) + JSON_OBJECT_SIZE(6) + 2*JSON_OBJECT_SIZE(7) + 4*JSON_OBJECT_SIZE(8) + 770 + 1000;
+              const size_t propcapacity = 16300;
               DynamicJsonDocument propdoc(propcapacity);
+              Serial.println("Created the second JSON document");
               auto propJSONerr = deserializeJson(propdoc, propjson);
               if(propJSONerr) {
                 Serial.println("Properties JSON parsing failed");
@@ -530,15 +637,18 @@ void update_glycemia() {
                 M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
                 M5.Lcd.drawString("???", 130, 24, GFXFF);
               } else {
+                Serial.println("Deserialized the second JSON and OK");
                 JsonObject iob = propdoc["iob"];
                 float iob_iob = iob["iob"]; // 0
-                const char* iob_display = iob["display"]; // "0"
-                const char* iob_displayLine = iob["displayLine"]; // "IOB: 0U"
+                const char* iob_display = iob["display"] | "N/A"; // "0"
+                const char* iob_displayLine = iob["displayLine"] | "IOB: N/A"; // "IOB: 0U"
+                Serial.println("IOB OK");
                 
                 JsonObject cob = propdoc["cob"];
                 float cob_cob = cob["cob"]; // 0
-                int cob_display = cob["display"]; // 0
-                const char* cob_displayLine = cob["displayLine"]; // "COB: 0g"
+                const char* cob_display = cob["display"] | "N/A"; // 0
+                const char* cob_displayLine = cob["displayLine"] | "COB: N/A"; // "COB: 0g"
+                Serial.println("COB OK");
                 
                 JsonObject delta = propdoc["delta"];
                 int delta_absolute = delta["absolute"]; // -4
@@ -547,22 +657,42 @@ void update_glycemia() {
                 int delta_mean5MinsAgo = delta["mean5MinsAgo"]; // 69
                 int delta_mgdl = delta["mgdl"]; // -4
                 float delta_scaled = delta["scaled"]; // -0.2
-                const char* delta_display = delta["display"]; // "-0.2"
+                const char* delta_display = delta["display"] | ""; // "-0.2"
                 M5.Lcd.fillRect(130,24,69,23,TFT_BLACK);
                 M5.Lcd.drawString(delta_display, 130, 24, GFXFF);
-      
+                Serial.println("DELTA OK");
+                
+                JsonObject loop_obj = propdoc["loop"];
+                JsonObject loop_display = loop_obj["display"];
+                const char* loop_display_symbol = loop_display["symbol"] | "?"; // "⌁"
+                const char* loop_display_code = loop_display["code"] | "N/A"; // "enacted"
+                const char* loop_display_label = loop_display["label"] | "N/A"; // "Enacted"
+                Serial.println("LOOP OK");
+
+                JsonObject basal = propdoc["basal"];
+                const char* basal_display = basal["display"] | "N/A"; // "T: 0.950U"      
+                Serial.println("BASAL OK");
+
+                strlcpy(loopInfoStr, loop_display_label, 64);
+                strlcpy(basalInfoStr, basal_display, 64);
+                Serial.println("LOOP copy string OK");
+                
                 if(cfg.show_COB_IOB) {
                   M5.Lcd.fillRect(0,48,199,47,TFT_BLACK);
                   if(iob_iob>0)
                     M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
                   else
                     M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                  Serial.print("iob_displayLine=\""); Serial.print(iob_displayLine); Serial.println("\"");
                   M5.Lcd.drawString(iob_displayLine, 0, 48, GFXFF);
+                  Serial.println("drawString IOB OK");
                   if(cob_cob>0)
                     M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
                   else
                     M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                  Serial.print("cob_displayLine=\""); Serial.print(cob_displayLine); Serial.println("\"");
                   M5.Lcd.drawString(cob_displayLine, 0, 72, GFXFF);
+                  Serial.println("drawString COB OK");
                 }
               }
             }
@@ -707,9 +837,11 @@ void update_glycemia() {
           }
           M5.Lcd.setTextSize(1);
           M5.Lcd.setFreeFont(FSSB12);
+          // Serial.print("sensSgv="); Serial.print(sensSgv); Serial.print(", cfg.snd_alarm="); Serial.println(cfg.snd_alarm); 
           if((sensSgv<=cfg.snd_alarm) && (sensSgv>=0.1)) {
             // red alarm state
             // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
+            Serial.println("ALARM LOW");
             M5.Lcd.fillRect(0, 220, 320, 20, TFT_RED);
             M5.Lcd.setTextColor(TFT_BLACK, TFT_RED);
             int stw=M5.Lcd.textWidth(tmpStr);
@@ -722,6 +854,7 @@ void update_glycemia() {
             if((sensSgv<=cfg.snd_warning) && (sensSgv>=0.1)) {
               // yellow warning state
               // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
+              Serial.println("WARNING LOW");
               M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
               M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
               int stw=M5.Lcd.textWidth(tmpStr);
@@ -734,6 +867,7 @@ void update_glycemia() {
               if( sensSgv>=cfg.snd_alarm_high ) {
                 // red alarm state
                 // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
+                Serial.println("ALARM HIGH");
                 M5.Lcd.fillRect(0, 220, 320, 20, TFT_RED);
                 M5.Lcd.setTextColor(TFT_BLACK, TFT_RED);
                 int stw=M5.Lcd.textWidth(tmpStr);
@@ -746,6 +880,7 @@ void update_glycemia() {
                 if( sensSgv>=cfg.snd_warning_high ) {
                   // yellow warning state
                   // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
+                  Serial.println("WARNING HIGH");
                   M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
                   M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
                   int stw=M5.Lcd.textWidth(tmpStr);
@@ -758,6 +893,7 @@ void update_glycemia() {
                   if( sensorDifMin>=cfg.snd_no_readings ) {
                     // yellow warning state
                     // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
+                    Serial.println("WARNING NO READINGS");
                     M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
                     M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
                     int stw=M5.Lcd.textWidth(tmpStr);
@@ -770,18 +906,39 @@ void update_glycemia() {
                     // normal glycemia state
                     M5.Lcd.fillRect(0, 220, 320, 20, TFT_BLACK);
                     M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-                    char devStr[64];
-                    strcpy(devStr, sensDev);
-                    if(strcmp(devStr,"MIAOMIAO")==0) {
-                      if(obj.containsKey("xDrip_raw")) {
-                        strcpy(devStr,"xDrip MiaoMiao + Libre");
-                      } else {
-                        strcpy(devStr,"Spike MiaoMiao + Libre");
-                      }
+                    // draw info line
+                    char infoStr[64];
+                    switch( cfg.info_line ) {
+                      case 0: // sensor information
+                        strcpy(infoStr, sensDev);
+                        if(strcmp(infoStr,"MIAOMIAO")==0) {
+                          if(obj.containsKey("xDrip_raw")) {
+                            strcpy(infoStr,"xDrip MiaoMiao + Libre");
+                          } else {
+                            strcpy(infoStr,"Spike MiaoMiao + Libre");
+                          }
+                        }
+                        if(strcmp(infoStr,"Tomato")==0)
+                          strcat(infoStr," MiaoMiao + Libre");
+                        M5.Lcd.drawString(infoStr, 0, 220, GFXFF);
+                        break;
+                      case 1: // button function icons
+                        // M5.Lcd.drawBitmap(50, 224, 16, 16, (uint8_t*)home_icon16x16);
+                        // M5.Lcd.pushImage(50, 224, 16, 16, (uint8_t*)home_icon16x16);
+                        drawIcon(58, 220, (uint8_t*)sun_icon16x16, TFT_LIGHTGREY);
+                        drawIcon(153, 220, (uint8_t*)clock_icon16x16, TFT_LIGHTGREY);
+                        // drawIcon(153, 220, (uint8_t*)timer_icon16x16, TFT_LIGHTGREY);
+                        drawIcon(246, 220, (uint8_t*)powerbutton_icon16x16, TFT_LIGHTGREY);
+                        break;
+                      case 2: // loop + basal information
+                        strcpy(infoStr, "L: ");
+                        strlcat(infoStr, loopInfoStr, 64);
+                        M5.Lcd.drawString(infoStr, 0, 220, GFXFF);
+                        strcpy(infoStr, "B: ");
+                        strlcat(infoStr, basalInfoStr, 64);
+                        M5.Lcd.drawString(infoStr, 160, 220, GFXFF);
+                        break;
                     }
-                    if(strcmp(devStr,"Tomato")==0)
-                      strcat(devStr," MiaoMiao + Libre");
-                    M5.Lcd.drawString(devStr, 0, 220, GFXFF);
                   }
                 }
               }
@@ -838,18 +995,19 @@ void loop(){
       M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
       if(!getLocalTime(&localTimeInfo)) {
         // unknown time
-        strcpy(localTimeStr,"??:??:??");
-        lastSec = 61;
+        strcpy(localTimeStr,"??:??");
+        lastMin = 61;
       } else {
         if(getLocalTime(&localTimeInfo)) {
-          sprintf(localTimeStr, "%02d:%02d:%02d  %d.%d.  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_sec, localTimeInfo.tm_mday, localTimeInfo.tm_mon+1);  
+          sprintf(localTimeStr, "%02d:%02d  %d.%d.  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mday, localTimeInfo.tm_mon+1);  
         } else {
-          strcpy(localTimeStr, "??:??:??");
-          lastSec = 61;
+          strcpy(localTimeStr, "??:??");
+          lastMin = 61;
         }
       }
-      if(lastSec!=localTimeInfo.tm_sec) {
+      if(lastMin!=localTimeInfo.tm_min) {
         lastSec=localTimeInfo.tm_sec;
+        lastMin=localTimeInfo.tm_min;
         M5.Lcd.drawString(localTimeStr, 0, 0, GFXFF);
       }
     }

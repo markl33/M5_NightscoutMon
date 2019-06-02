@@ -1,4 +1,4 @@
-# M5_NightscoutMon
+﻿# M5_NightscoutMon
 ## M5Stack Nightscout monitor
 
 ###### M5Stack Nightscout monitor<br/>Copyright (C) 2018, 2019 Martin Lukasek <martin@lukasek.cz>
@@ -9,6 +9,12 @@
 <br/>
 
 ### Revisions:
+
+#### *** 18 May 2019 ***
+Added button function icons (set M5NS.INI key info_line = 1). This is now default option.<br/>
+Added loop and basal info (set M5NS.INI key info_line = 2)<br/>
+Original sensor information available when M5NS.INI key info_line = 0<br/>
+Small changes to silence background hiss as much as possible.<br/>
 
 #### *** 12 May 2019 ***
 BG/calibration/unknown entries are now filtered.<br/>
@@ -109,6 +115,10 @@ snd_no_readings = 20 – softer high beep sound will beep every 5 mins when time
 warning_volume = 20 - volume of warning sound in range 0-100 (0=no sound, 1=silent, 100=max volume)
 
 alarm_volume = 100 - volume of alarm sound in range 0-100 (0=no sound, 1=silent, 100=max volume)
+
+
+
+info_line = 1 - 0 = sensor info, 1 = button function icons, 2 = loop info + basal
 
 
 
