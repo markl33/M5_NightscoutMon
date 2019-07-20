@@ -10,6 +10,10 @@
 
 ### Revisions:
 
+#### *** 17 July 2019 *** Patrick
+Adding Dexcom as a source. You need Sugarmate to get your external JSON.<br/>
+nightscout = sugarmate.io/api/v1/xxxxxx/latest.json<br/>
+
 #### *** 18 May 2019 ***
 Added button function icons (set M5NS.INI key info_line = 1). This is now default option.<br/>
 Added loop and basal info (set M5NS.INI key info_line = 2)<br/>
