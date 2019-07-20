@@ -82,6 +82,19 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
       ;
   }
 
+  // begin Peter Leimbach
+  // Read the value of the token parameter from the config file
+  if (ini.getValue("config", "token", buffer, bufferLen)) {
+    Serial.print("section 'config' has an entry 'token' with value ");
+    Serial.println(buffer);
+    strlcpy(cfg->token, buffer, 32);
+  }
+  else {
+    // no token parameter set in INI file - no error just set cfg->token[0] to 0
+    cfg->token[0] = '\0';
+  }
+  // end Peter Leimbach
+
   if (ini.getValue("config", "bootpic", buffer, bufferLen)) {
     Serial.print("bootpic = ");
     Serial.println(buffer);
@@ -130,6 +143,36 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
   else {
     Serial.println("NO show_mgdl defined -> 0 = show mmol/L");
     cfg->show_mgdl = 0;
+  }
+
+  if (ini.getValue("config", "default_page", buffer, bufferLen)) {
+    Serial.print("default_page = ");
+    cfg->default_page = atoi(buffer);
+    Serial.println(cfg->default_page);
+  }
+  else {
+    Serial.println("NO default page defined -> page 0 is default");
+    cfg->default_page = 0;
+  }
+
+  if (ini.getValue("config", "restart_at_time", buffer, bufferLen)) {
+    Serial.print("restart_at_time = ");
+    strlcpy(cfg->restart_at_time, buffer, 10);
+    Serial.println(cfg->restart_at_time);
+  }
+  else {
+    Serial.println("NO restart_at_time defined -> no restarts");
+    strcpy(cfg->restart_at_time, "NORES");
+  }
+
+  if (ini.getValue("config", "restart_at_logged_errors", buffer, bufferLen)) {
+    Serial.print("restart_at_logged_errors = ");
+    cfg->restart_at_logged_errors = atoi(buffer);
+    Serial.println(cfg->restart_at_logged_errors);
+  }
+  else {
+    Serial.println("NO restart_at_logged_errors defined -> no restarts");
+    cfg->restart_at_logged_errors = 0;
   }
 
   if (ini.getValue("config", "show_current_time", buffer, bufferLen)) {
@@ -288,6 +331,26 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
     cfg->snd_no_readings = 20;
   }
 
+  if (ini.getValue("config", "snd_warning_at_startup", buffer, bufferLen)) {
+    Serial.print("snd_warning_at_startup = ");
+    cfg->snd_warning_at_startup = atoi(buffer);
+    Serial.println(cfg->snd_warning_at_startup);
+  }
+  else {
+    Serial.println("NO snd_warning_at_startup defined -> enable warning sound at startup");
+    cfg->snd_warning_at_startup = 1;
+  }
+  
+  if (ini.getValue("config", "snd_alarm_at_startup", buffer, bufferLen)) {
+    Serial.print("snd_alarm_at_startup = ");
+    cfg->snd_alarm_at_startup = atoi(buffer);
+    Serial.println(cfg->snd_alarm_at_startup);
+  }
+  else {
+    Serial.println("NO snd_alarm_at_startup defined -> disable alarm sound at startup");
+    cfg->snd_alarm_at_startup = 0;
+  }
+  
   if (ini.getValue("config", "warning_music", buffer, bufferLen)) {
     Serial.print("warning_music = ");
     Serial.println(buffer);
@@ -305,7 +368,7 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
   }
   else {
     Serial.println("NO warning_volume defined");
-    cfg->warning_volume = 30;
+    cfg->warning_volume = 50;
   }
 
   if (ini.getValue("config", "alarm_music", buffer, bufferLen)) {
@@ -372,64 +435,25 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
     Serial.println("NO brightness3");
     cfg->brightness3 = 10;
   }
+ for(int i=0; i<=9; i++) {
+    char wlansection[10];
+    sprintf(wlansection, "wlan%1d", i);
 
-  if (ini.getValue("wlan1", "ssid", buffer, bufferLen)) {
-    Serial.print("wlan1ssid = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan1ssid, buffer,32);
-  }
-  else {
-    Serial.println("NO wlan1 ssid");
-    cfg->wlan1ssid[0] = 0;
-  }
-
-  if (ini.getValue("wlan1", "pass", buffer, bufferLen)) {
-    Serial.print("wlan1pass = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan1pass, buffer, 32);
-  }
-  else {
-    Serial.println("NO wlan1 pass");
-    cfg->wlan1pass[0] = 0;
-  }
-
-  if (ini.getValue("wlan2", "ssid", buffer, bufferLen)) {
-    Serial.print("wlan2ssid = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan2ssid, buffer, 32);
-  }
-  else {
-    Serial.println("NO wlan2 ssid");
-    cfg->wlan2ssid[0] = 0;
+    if (ini.getValue(wlansection, "ssid", buffer, bufferLen)) {
+      Serial.printf("[wlan%1d] ssid = %s\n", i, buffer);
+      strlcpy(cfg->wlanssid[i], buffer,32);
+    } else {
+      Serial.printf("NO [wlan%1d] ssid\n", i);
+      cfg->wlanssid[i][0] = 0;
+    }
+  
+    if (ini.getValue(wlansection, "pass", buffer, bufferLen)) {
+      Serial.printf("[wlan%1d] pass = %s\n", i, buffer);
+      strlcpy(cfg->wlanpass[i], buffer, 32);
+    } else {
+      Serial.printf("NO [wlan%1d] pass\n", i);
+      cfg->wlanpass[i][0] = 0;
+    }
   }
 
-  if (ini.getValue("wlan2", "pass", buffer, bufferLen)) {
-    Serial.print("wlan2pass = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan2pass, buffer, 32);
-  }
-  else {
-    Serial.println("NO wlan2 pass");
-    cfg->wlan2pass[0] = 0;
-  }
-
-  if (ini.getValue("wlan3", "ssid", buffer, bufferLen)) {
-    Serial.print("wlan3ssid = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan3ssid, buffer, 32);
-  }
-  else {
-    Serial.println("NO wlan3 ssid");
-    cfg->wlan3ssid[0] = 0;
-  }
-
-  if (ini.getValue("wlan3", "pass", buffer, bufferLen)) {
-    Serial.print("wlan3pass = ");
-    Serial.println(buffer);
-    strlcpy(cfg->wlan3pass, buffer, 32);
-  }
-  else {
-    Serial.println("NO wlan3 pass");
-    cfg->wlan3pass[0] = 0;
-  }
 }
