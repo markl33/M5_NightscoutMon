@@ -23,6 +23,10 @@
 
 ### Revisions:
 
+#### *** 17 July 2019 *** Patrick
+Adding Dexcom as a source. You need Sugarmate to get your external JSON.<br/>
+nightscout = sugarmate.io/api/v1/xxxxxx/latest.json<br/>
+
 #### *** 20 June 2019 ***
 Split of Nightscout read and display code (this should allow simpler user display code update and more different "faces" from users).  
 New concept of display pages (different display designs, information, faces).  
