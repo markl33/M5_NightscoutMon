@@ -5,9 +5,9 @@
 ###### This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 ###### This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 ###### You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
-###### This software uses some 3rd party libraries:<br/>IniFile by Steve Marple (GNU LGPL v2.1)<br/>ArduinoJson by Benoit BLANCHON (MIT License)<br/>IoT Icon Set by Artur Funk (GPL v3)<br/>Additions to the code:<br/>Peter Leimbach (Nightscout token)
+###### This software uses some 3rd party libraries:<br/>IniFile by Steve Marple (GNU LGPL v2.1)<br/>ArduinoJson by Benoit BLANCHON (MIT License)<br/>IoT Icon Set by Artur Funk (GPL v3)<br/>DHT12 by Bobadas (Public domain)<br/><br/>Additions to the code:<br/>Peter Leimbach (Nightscout token)<br/>Patrick Sonnerat (Dexcom Sugarmate connection)<br/>Sulka Haro (Nightscout API queries help)
 
-<img width="320" src="https://raw.githubusercontent.com/mlukasek/M5_NightscoutMon/master/images/M5NS_mon_2019-06-20_page1.jpg">&nbsp;&nbsp;<img width="320" src="https://raw.githubusercontent.com/mlukasek/M5_NightscoutMon/master/images/M5NS_mon_2019-06-20_page2.jpg">
+<img width="240" src="https://raw.githubusercontent.com/mlukasek/M5_NightscoutMon/master/images/M5NS_mon_2019-06-20_page1.jpg">&nbsp;&nbsp;<img width="240" src="https://raw.githubusercontent.com/mlukasek/M5_NightscoutMon/master/images/M5NS_mon_2019-06-20_page2.jpg">&nbsp;&nbsp;<img width="240" src="https://raw.githubusercontent.com/mlukasek/M5_NightscoutMon/master/images/M5NS_mon_2019-06-20_page3.jpg">
 
 
 ### Contents
@@ -23,9 +23,19 @@
 
 ### Revisions:
 
-#### *** 17 July 2019 *** Patrick
-Adding Dexcom as a source. You need Sugarmate to get your external JSON.<br/>
-nightscout = sugarmate.io/api/v1/xxxxxx/latest.json<br/>
+#### *** 23 September 2019 ***
+Key sgv_only (default 0) added to M5NS.INI. You shoul set it to 1 if you use xDrip, Spike or similar to filter out calibrations etc.
+Explicit M5.Lcd.invertDisplay(0) added to try to prevent inverted display.
+
+#### *** 21 September 2019 ***
+Added support for Dexcom by using Sugarmate connection workaround. Thanks to Patrick Sonnerat.  
+Only SGV entries are now queried, so no more troubles with calibration. Thanks to Sulka Haro.  
+Fast page switching. No need to wait for NS data (does not work while accessing Nightscout = while blue WiFi icon displayed).  
+New page with analog clock and Temperature/Humidity. Display environment values requires DHT12 - ENV Unit or BTC Standing Base.  
+New key in M5NS.INI temperature_unit = 1 for CELSIUS, 2 for KELVIN, 3 for FAHRENHEIT. Can be omitted (default is Celsius).  
+Display rotation possibility added. New key in M5NS.INI display_rotation = 1 (buttons down, default, can be omitted), 3 = buttons up, 5 = mirror buttons up, 7 = mirror buttons down.  
+US date format added. New key in M5NS.INI date_format = 0 (dd.mm., default, can be omitted), 1 = MM/DD.  
+JSON query update for some Bluetooth Glucose Meters.    
 
 #### *** 20 June 2019 ***
 Split of Nightscout read and display code (this should allow simpler user display code update and more different "faces" from users).  
@@ -139,6 +149,7 @@ name = YourName _– display name_
 time_zone = 3600 _– the time zone where you live in seconds (3600 is GMT+1, Prague)_  
 dst = 3600 _– your daylight saving time offset (3600s is +1 hour)_  
 show_mgdl = 0 _– use 0 to display values in mmol/L or 1 for mg/dl_  
+sgv_only = 0 _- set to 1 if you use xDrip, Spike or similar to filter out calibrations etc_  
 default_page = 0 _– page number displayed after startup_  
 show_current_time = 1 _– show current time instead of last valid data time_  
 restart_at_time = HH:MM _– time in HH:MM format when the device will restart_  
@@ -147,6 +158,9 @@ show_COB_IOB = 1 _– show COB and IOB, values are grayed out if COB/IOB value i
 snooze_timeout = 30 _- sound snooze time in minutes after press of the middle button_  
 alarm_repeat = 5 _- sound repeat interval in minutes (alarm repeats only if alarm/warning conditions are met)_  
 info_line = 1 _- 0 = sensor info, 1 = button function icons, 2 = loop info + basal_  
+temperature_unit = 1 _- 1 = CELSIUS, 2 = KELVIN, 3 = FAHRENHEIT. Can be omitted (default is Celsius)._  
+display_rotation = 1 _- 1 = buttons down (default, can be omitted), 3 = buttons up, 5 = mirror buttons up, 7 = mirror buttons down_  
+date_format = 0 _- 0 = dd.mm. (default, can be omitted), 1 = MM/DD_  
 brightness1 = 50 _– the first (default) brightness value_  
 brightness2 = 100 _– the second brightness value_  
 brightness3 = 10 _– the third brightness value_
@@ -197,6 +211,13 @@ Long distance visible page with large BG value and larger clock. Top line contai
 
 Bottom info line is the same as on page 0.
 
+**Page 2 - analog clock with temperature and humidity**  
+Large analog clock with date. BG value in top left corner with time difference from the last reading. BG delta value in top right corner and arrow pointing chinge direction bellow it.
+
+This screen contatins environmental values form DHT12 sensor. Requires ENV Unit or BTC Standing Base connected to MStack. The temperature is in lower left corner and humidity in lower right corner. Temperature unit can be set in M5NS.INI.
+
+Bottom info line is the same as on page 0.
+
 **Error Log page**
 Displays last 10 record errors and total number of errors record since last restart. Occasional communication errors, such as "timeout" or "connection refused" are normal and happen sometimes due to WiFi and internet connection and Nightscout site status. If you have a lot of errors every few minutes, consider to move your M5Stack to a different place or extend WiFi signal.  
 <br/>
@@ -207,7 +228,7 @@ The left button changes the backlight in the 3 steps defined in M5NS.INI file.
 
 The middle button snoozes M5Stack for defined time to prevent alarm or warning sound. You can "snooze" it even before the alarm is activated. Snooze active is indicated by red clock icon in status icon area.
 
-Shor press of the right button switches display pages. Long press (4 seconds) puts M5Stack to the sleep as it is a little bit tricky to double click standard red power button.  
+Short press of the right button switches display pages. Long press (4 seconds) puts M5Stack to the sleep as it is a little bit tricky to double click standard red power button.  
 <br/>
 
 ### Battery

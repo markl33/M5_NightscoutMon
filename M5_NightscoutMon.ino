@@ -18,8 +18,11 @@
     IniFile by Steve Marple <stevemarple@googlemail.com> (GNU LGPL v2.1)
     ArduinoJson by Benoit BLANCHON (MIT License) 
     IoT Icon Set by Artur Funk (GPL v3)
+    DHT12 by Bobadas (Public domain)
     Additions to the code:
     Peter Leimbach (Nightscout token)
+    Patrick Sonnerat (Dexcom Sugarmate connection)
+    Sulka Haro (Nightscout API queries help)
 */
 
 #include <M5Stack.h>
@@ -34,10 +37,11 @@
 #include "Free_Fonts.h"
 #include "IniFile.h"
 #include "M5NSconfig.h"
+#include "DHT12.h"
+#include <Wire.h>     //The DHT12 uses I2C comunication.
+DHT12 dht12;          //Preset scale CELSIUS and ID 0x5c.
 
-extern const unsigned char m5stack_startup_music[];
-extern const unsigned char WiFi_symbol[];
-extern const unsigned char alarmSndData[];
+// extern const unsigned char alarmSndData[];
 
 extern const unsigned char sun_icon16x16[];
 extern const unsigned char clock_icon16x16[];
@@ -64,7 +68,6 @@ int MAX_TIME_RETRY = 30;
 int lastSec = 61;
 int lastMin = 61;
 char localTimeStr[30];
-int updated = 0;
 
 struct err_log_item {
   struct tm err_time;
@@ -74,9 +77,14 @@ int err_log_ptr = 0;
 int err_log_count = 0;
 
 int dispPage = 0;
-#define MAX_PAGE 2
+#define MAX_PAGE 3
+// icon positions for the first page - WiFi/log, Snooze, Battery
 int icon_xpos[3] = {144, 144+18, 144+2*18};
 int icon_ypos[3] = {0, 0, 0};
+
+// analog clock global variables
+uint16_t osx=120, osy=120, omx=120, omy=120, ohx=120, ohy=120;  // Saved H, M, S x & y coords
+boolean initial = 1;
 
 #ifndef min
   #define min(a,b) (((a) < (b)) ? (a) : (b))
@@ -93,6 +101,41 @@ DynamicJsonDocument JSONdoc(16384);
 time_t lastAlarmTime = 0;
 time_t lastSnoozeTime = 0;
 static uint8_t music_data[25000]; // 5s in sample rate 5000 samp/s
+
+struct NSinfo {
+  char sensDev[64];
+  uint64_t rawtime = 0;
+  time_t sensTime = 0;
+  struct tm sensTm;
+  char sensDir[32];
+  float sensSgvMgDl = 0;
+  float sensSgv = 0;
+  float last10sgv[10];
+  bool is_xDrip = 0;  
+  bool is_Sugarmate = 0;  
+  int arrowAngle = 180;
+  float iob = 0;
+  char iob_display[16];
+  char iob_displayLine[16];
+  float cob = 0;
+  char cob_display[16];
+  char cob_displayLine[16];
+  int delta_absolute = 0;
+  float delta_elapsedMins = 0;
+  bool delta_interpolated = 0;
+  int delta_mean5MinsAgo = 0;
+  int delta_mgdl = 0;
+  float delta_scaled = 0;
+  char delta_display[16];
+  char loop_display_symbol = '?';
+  char loop_display_code[16];
+  char loop_display_label[16];
+  char basal_display[16];
+  float basal_current = 0;
+  float basal_tempbasal = 0;
+  float basal_combobolusbasal = 0;
+  float basal_totalbasal = 0;
+} ns;
 
 void setPageIconPos(int page) {
   switch(page) {
@@ -112,10 +155,18 @@ void setPageIconPos(int page) {
       icon_ypos[1] = 0;
       icon_ypos[2] = 18; // 220;
       break;
+    case 2:
+      icon_xpos[0] = 0+18;
+      icon_xpos[1] = 0+18;
+      icon_xpos[2] = 0+18;
+      icon_ypos[0] = 110-18-9;
+      icon_ypos[1] = 110-18+9;
+      icon_ypos[2] = 110-18+27;
+      break;
     default:
-      icon_xpos[0] = 144;
-      icon_xpos[1] = 144+18;
-      icon_xpos[2] = 144+2*18;
+      icon_xpos[0] = 266;
+      icon_xpos[1] = 266+18;
+      icon_xpos[2] = 266+2*18;
       icon_ypos[0] = 0;
       icon_ypos[1] = 0;
       icon_ypos[2] = 0;
@@ -289,9 +340,10 @@ void buttons_test() {
     } else {
       lastSnoozeTime=mktime(&timeinfo);
     }
+    M5.Lcd.fillRect(110, 220, 100, 20, TFT_WHITE);
+    M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextSize(1);
     M5.Lcd.setFreeFont(FSSB12);
-    M5.Lcd.fillRect(110, 220, 100, 20, TFT_WHITE);
     M5.Lcd.setTextColor(TFT_BLACK, TFT_WHITE);
     char tmpStr[10];
     sprintf(tmpStr, "%i", cfg.snooze_timeout);
@@ -337,10 +389,10 @@ void buttons_test() {
       dispPage++;
       if(dispPage>MAX_PAGE)
         dispPage = 0;
-      // update_glycemia();
       setPageIconPos(dispPage);
       M5.Lcd.clear(BLACK);
-      msCount = millis()-16000;
+      // msCount = millis()-16000;
+      draw_page();
       // play_tone(440, 100, 1);
     }
     /*
@@ -449,6 +501,7 @@ void setup() {
     // M5.Speaker.mute();
 
     // Lcd display
+    M5.Lcd.invertDisplay(0);
     M5.Lcd.setBrightness(100);
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setTextColor(WHITE);
@@ -487,13 +540,15 @@ void setup() {
     M5.Lcd.printf("SD Card Size: %llu MB\n", cardSize);
 
     readConfiguration(iniFilename, &cfg);
-    // strcpy(cfg.url, "user.herokuapp.com");
-    // cfg.dev_mode = 0;
+    // strcpy(cfg.url, "https://sugarmate.io/api/v1/xxxxxx/latest.json");
+    // strcpy(cfg.url, "user.herokuapp.com"); 
+    // cfg.dev_mode = 1;
     // cfg.show_mgdl = 1;
-    // cfg.default_page = 1;
+    // cfg.sgv_only = 1;
+    // cfg.default_page = 2;
     // strcpy(cfg.restart_at_time, "21:59");
     // cfg.restart_at_logged_errors=3;
-    // cfg.show_COB_IOB = 1;
+    // cfg.show_COB_IOB = 0;
     // cfg.snd_warning = 5.5;
     // cfg.snd_alarm = 4.5;
     // cfg.snd_warning_high = 9;
@@ -506,8 +561,12 @@ void setup() {
     // cfg.alarm_repeat = 1;
     // cfg.snooze_timeout = 2;
     // cfg.brightness1 = 0;
+    // cfg.temperature_unit = 3;
+    // cfg.date_format = 1;
+    // cfg.display_rotation = 7;
     // cfg.info_line = 1;
 
+    M5.Lcd.setRotation(cfg.display_rotation);
     lcdBrightness = cfg.brightness1;
     M5.Lcd.setBrightness(lcdBrightness);
     
@@ -542,7 +601,7 @@ void setup() {
 
     M5.Lcd.setBrightness(lcdBrightness);
     M5.Lcd.fillScreen(BLACK);
-
+    
     // fill dummy values to error log
     /*
     for(int i=0; i<10; i++) {
@@ -590,40 +649,6 @@ void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uin
   M5.Lcd.drawLine(x-2, y, xx1-2, yy1, color);
   M5.Lcd.drawLine(x, y-2, xx1, yy1-2, color);
 }
-
-struct NSinfo {
-  char sensDev[64];
-  uint64_t rawtime = 0;
-  time_t sensTime = 0;
-  struct tm sensTm;
-  char sensDir[32];
-  float sensSgvMgDl = 0;
-  float sensSgv = 0;
-  float last10sgv[10];
-  bool is_xDrip = 0;  
-  int arrowAngle = 180;
-  float iob = 0;
-  char iob_display[16];
-  char iob_displayLine[16];
-  float cob = 0;
-  char cob_display[16];
-  char cob_displayLine[16];
-  int delta_absolute = 0;
-  float delta_elapsedMins = 0;
-  bool delta_interpolated = 0;
-  int delta_mean5MinsAgo = 0;
-  int delta_mgdl = 0;
-  float delta_scaled = 0;
-  char delta_display[16];
-  char loop_display_symbol = '?';
-  char loop_display_code[16];
-  char loop_display_label[16];
-  char basal_display[16];
-  float basal_current = 0;
-  float basal_tempbasal = 0;
-  float basal_combobolusbasal = 0;
-  float basal_totalbasal = 0;
-} ns;
 
 void drawMiniGraph(struct NSinfo *ns){
   /*
@@ -678,7 +703,6 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
   char NSurl[128];
   int err=0;
   char tmpstr[32];
-  int sugarmate = 0, trend = 0;
   
   if((WiFiMulti.run() == WL_CONNECTED)) {
     // configure target server and url
@@ -688,17 +712,24 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
       strcpy(NSurl,"");
     strcat(NSurl,url);
     if(strstr(NSurl,"sugarmate") != NULL) // Sugarmate JSON URL for Dexcom follower
-      sugarmate  = 1;
+      ns->is_Sugarmate = 1;
     else
     {
-      sugarmate = 0;
-      strcat(NSurl,"/api/v1/entries.json"); // standard NS
-      if ((token!=NULL) && (strlen(token)>0)){
-        strcat(NSurl,"?token=");
+      ns->is_Sugarmate = 0;
+      if(cfg.sgv_only) {
+        strcat(NSurl,"/api/v1/entries.json?find[type][$eq]=sgv");
+      } else {
+        strcat(NSurl,"/api/v1/entries.json");
+      }
+      if ((token!=NULL) && (strlen(token)>0)) {
+        if(strchr(NSurl,'?'))
+          strcat(NSurl,"&token=");
+        else
+          strcat(NSurl,"?token=");
         strcat(NSurl,token);
+      }
     }
-    }
-
+  
     M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
     drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi2_icon16x16, TFT_BLUE);
     
@@ -717,146 +748,115 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
       // file found at server
       if(httpCode == HTTP_CODE_OK) {
         String json = http.getString();
-       // Serial.println(json);
+        // remove any non text characters (just for sure)
+        for(int i=0; i<json.length(); i++) {
+          // Serial.print(json.charAt(i), DEC); Serial.print(" = "); Serial.println(json.charAt(i));
+          if(json.charAt(i)<32 /* || json.charAt(i)=='\\' */) {
+            json.setCharAt(i, 32);
+          }
+        }
+        // json.replace("\\n"," ");
+        // invalid Unicode character defined by Ascensia Diabetes Care Bluetooth Glucose Meter
+        // ArduinoJSON does not accept any unicode surrogate pairs like \u0032 or \u0000
+        json.replace("\\u0000"," ");
+        json.replace("\\u0032"," ");
+        // Serial.println(json);
         // const size_t capacity = JSON_ARRAY_SIZE(10) + 10*JSON_OBJECT_SIZE(19) + 3840;
         // Serial.print("JSON size needed= "); Serial.print(capacity); 
         Serial.print("Free Heap = "); Serial.println(ESP.getFreeHeap());
-        auto JSONerr = deserializeJson(JSONdoc, json);
+        DeserializationError JSONerr = deserializeJson(JSONdoc, json);
         Serial.println("JSON deserialized OK");
-        
         JsonArray arr=JSONdoc.as<JsonArray>();
         Serial.print("JSON array size = "); Serial.println(arr.size());
-        
-        if (JSONerr) {   //Check for errors in parsing
+        if (JSONerr || (ns->is_Sugarmate==0 && arr.size()==0)) {   //Check for errors in parsing
           if(JSONerr) {
             err=1001; // "JSON parsing failed"
           } else {
             err=1002; // "No data from Nightscout"
           }
           addErrorLog(err);
-        } else if(sugarmate) {               // ---------------------------------- Sugarmate Section
-          
-          Serial.println("Sugarmate");
- 
-           strlcpy(ns->sensDev, "Dexcom", 64);
-           ns->is_xDrip = 0;
-           ns->sensTime = JSONdoc["x"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118         
-           strlcpy(ns->sensDir, JSONdoc["trend_words"] | "N/A", 32);
-           ns->sensSgv = JSONdoc["value"]; // get value of sensor measurement
-           
-           ns->sensSgvMgDl = ns->sensSgv;
-           // internally we work in mmol/L
-           ns->sensSgv/=18.0;
+        } else {
+          JsonObject obj;
+          if(ns->is_Sugarmate==0) {
+            // Nightscout values
 
-           int sensorDifSec=0;
-           struct tm timeinfo;
-           if(!getLocalTime(&timeinfo)){
-             sensorDifSec=24*60*60; // too much
-           } else {
-             sensorDifSec=difftime(mktime(&timeinfo), ns->sensTime);
-           }
-
-          Serial.print("Last value = ");
-          Serial.println(sensorDifSec);
-
-           if((sensorDifSec < 300) && !updated) {
-             for(int i=9; i>=0; i--) {                  // only 1 reading in sugarmate. roll buffer every new value
-               ns->last10sgv[i]=ns->last10sgv[i-1];
-             }
-             ns->last10sgv[0] = ns->sensSgv;
-             updated = 1;
-           } else if(sensorDifSec > 299) {
-             updated = 0;
-           }
-           
-           localtime_r(&ns->sensTime, &ns->sensTm);
-            ns->arrowAngle = 180;
-           if(strcmp(ns->sensDir,"DOUBLE_DOWN")==0)
-             ns->arrowAngle = 90;
-           else 
-             if(strcmp(ns->sensDir,"SINGLE_DOWN")==0)
-               ns->arrowAngle = 75;
-             else 
-                 if(strcmp(ns->sensDir,"FORTY_FIVE_DOWN")==0)
-                   ns->arrowAngle = 45;
-                 else 
-                     if(strcmp(ns->sensDir,"FLAT")==0)
-                       ns->arrowAngle = 0;
-                     else 
-                         if(strcmp(ns->sensDir,"FORTY_FIVE_UP")==0)
-                           ns->arrowAngle = -45;
-                         else 
-                             if(strcmp(ns->sensDir,"SINGLE_UP")==0)
-                               ns->arrowAngle = -75;
-                             else 
-                                 if(strcmp(ns->sensDir,"DOUBLE_UP")==0)
-                                   ns->arrowAngle = -90;
-                                 else 
-                                     if(strcmp(ns->sensDir,"NONE")==0)
-                                       ns->arrowAngle = 180;
-                                     else 
-                                         if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
-                                           ns->arrowAngle = 180;
-                                           
-        }
-        else if (arr.size()!=0){              // ---------------------------------- NS Section
-          JsonObject obj; 
-          int sgvindex = 0;
-
-          if(!sugarmate)
-          {
+            int sgvindex = 0;
             do {
               obj=JSONdoc[sgvindex].as<JsonObject>();
-             sgvindex++;
+              sgvindex++;
             } while ((!obj.containsKey("sgv")) && (sgvindex<(arr.size()-1)));
-           sgvindex--;
-           if(sgvindex<0 || sgvindex>(arr.size()-1))
-             sgvindex=0;
-           strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
-           ns->is_xDrip = obj.containsKey("xDrip_raw");         
-           ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118         
-           strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
-           ns->sensSgv = JSONdoc[sgvindex]["sgv"]; // get value of sensor measurement
-           ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
-           for(int i=0; i<=9; i++) {
-             ns->last10sgv[i]=JSONdoc[i]["sgv"];
-             ns->last10sgv[i]/=18.0;
-           }
-           ns->sensSgvMgDl = ns->sensSgv;
-           // internally we work in mmol/L
-           ns->sensSgv/=18.0;
-           
-           localtime_r(&ns->sensTime, &ns->sensTm);
-           
-           ns->arrowAngle = 180;
-           if(strcmp(ns->sensDir,"DoubleDown")==0)
-             ns->arrowAngle = 90;
-           else 
-             if(strcmp(ns->sensDir,"SingleDown")==0)
-               ns->arrowAngle = 75;
-             else 
-                 if(strcmp(ns->sensDir,"FortyFiveDown")==0)
-                   ns->arrowAngle = 45;
-                 else 
-                     if(strcmp(ns->sensDir,"Flat")==0)
-                       ns->arrowAngle = 0;
-                     else 
-                         if(strcmp(ns->sensDir,"FortyFiveUp")==0)
-                           ns->arrowAngle = -45;
-                         else 
-                             if(strcmp(ns->sensDir,"SingleUp")==0)
-                               ns->arrowAngle = -75;
-                             else 
-                                 if(strcmp(ns->sensDir,"DoubleUp")==0)
-                                   ns->arrowAngle = -90;
-                                 else 
-                                     if(strcmp(ns->sensDir,"NONE")==0)
-                                       ns->arrowAngle = 180;
-                                     else 
-                                         if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
-                                           ns->arrowAngle = 180;
-                                           
+            sgvindex--;
+            if(sgvindex<0 || sgvindex>(arr.size()-1))
+              sgvindex=0;
+            strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
+            ns->is_xDrip = obj.containsKey("xDrip_raw");
+            ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
+            ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
+            strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
+            ns->sensSgv = JSONdoc[sgvindex]["sgv"]; // get value of sensor measurement
+            for(int i=0; i<=9; i++) {
+              ns->last10sgv[i]=JSONdoc[i]["sgv"];
+              ns->last10sgv[i]/=18.0;
+            }
+          } else {
+            // Sugarmate values
+            strcpy(ns->sensDev, "Sugarmate");
+            ns->is_xDrip = 0;
+            ns->sensSgv = JSONdoc["value"]; // get value of sensor measurement
+            time_t tmptime = JSONdoc["x"]; // time in milliseconds since 1970
+            if(ns->sensTime != tmptime) {
+              for(int i=9; i>=0; i--) { // add new value and shift buffer
+               ns->last10sgv[i]=ns->last10sgv[i-1];
+              }
+              ns->last10sgv[0] = ns->sensSgv;
+              ns->sensTime = tmptime;
+            }
+            ns->rawtime = (long long)ns->sensTime * (long long)1000; // possibly not needed, but to make the structure values complete
+            strlcpy(ns->sensDir, JSONdoc["trend_words"] | "N/A", 32);
+            ns->delta_mgdl = JSONdoc["delta"]; // get value of sensor measurement
+            ns->delta_absolute = ns->delta_mgdl;
+            ns->delta_interpolated = 0;
+            ns->delta_scaled = ns->delta_mgdl/18.0;
+            if(cfg.show_mgdl) {
+              sprintf(ns->delta_display, "%+d", ns->delta_mgdl);
+            } else {
+              sprintf(ns->delta_display, "%+.1f", ns->delta_scaled);
+            }
           }
+          ns->sensSgvMgDl = ns->sensSgv;
+          // internally we work in mmol/L
+          ns->sensSgv/=18.0;
+          
+          localtime_r(&ns->sensTime, &ns->sensTm);
+          
+          ns->arrowAngle = 180;
+          if(strcmp(ns->sensDir,"DoubleDown")==0 || strcmp(ns->sensDir,"DOUBLE_DOWN")==0)
+            ns->arrowAngle = 90;
+          else 
+            if(strcmp(ns->sensDir,"SingleDown")==0 || strcmp(ns->sensDir,"SINGLE_DOWN")==0)
+              ns->arrowAngle = 75;
+            else 
+                if(strcmp(ns->sensDir,"FortyFiveDown")==0 || strcmp(ns->sensDir,"FORTY_FIVE_DOWN")==0)
+                  ns->arrowAngle = 45;
+                else 
+                    if(strcmp(ns->sensDir,"Flat")==0 || strcmp(ns->sensDir,"FLAT")==0)
+                      ns->arrowAngle = 0;
+                    else 
+                        if(strcmp(ns->sensDir,"FortyFiveUp")==0 || strcmp(ns->sensDir,"FORTY_FIVE_UP")==0)
+                          ns->arrowAngle = -45;
+                        else 
+                            if(strcmp(ns->sensDir,"SingleUp")==0 || strcmp(ns->sensDir,"SINGLE_UP")==0)
+                              ns->arrowAngle = -75;
+                            else 
+                                if(strcmp(ns->sensDir,"DoubleUp")==0 || strcmp(ns->sensDir,"DOUBLE_UP")==0)
+                                  ns->arrowAngle = -90;
+                                else 
+                                    if(strcmp(ns->sensDir,"NONE")==0)
+                                      ns->arrowAngle = 180;
+                                    else 
+                                        if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
+                                          ns->arrowAngle = 180;
+                                          
           Serial.print("sensDev = ");
           Serial.println(ns->sensDev);
           Serial.print("sensTime = ");
@@ -882,10 +882,14 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
     }
     http.end();
 
-    if(err!=0)
+    if(err!=0) {
+      Serial.printf("Returnining with error %d\n",err);
       return err;
+    }
+      
 
-    if(sugarmate) return !err;
+    if(ns->is_Sugarmate)
+      return 0; // no second query if using Sugarmate
       
     // the second query 
     if(strncmp(url, "http", 4))
@@ -911,7 +915,19 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
       if(httpCode == HTTP_CODE_OK) {
         // const char* propjson = "{\"iob\":{\"iob\":0,\"activity\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"display\":\"0\",\"displayLine\":\"IOB: 0U\"},\"cob\":{\"cob\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"treatmentCOB\":{\"decayedBy\":\"2019-05-11T23:05:00.000Z\",\"isDecaying\":0,\"carbs_hr\":20,\"rawCarbImpact\":0,\"cob\":7,\"lastCarbs\":{\"_id\":\"5cd74c26156712edb4b32455\",\"enteredBy\":\"Martin\",\"eventType\":\"Carb Correction\",\"reason\":\"\",\"carbs\":7,\"duration\":0,\"created_at\":\"2019-05-11T22:24:00.000Z\",\"mills\":1557613440000,\"mgdl\":67}},\"display\":0,\"displayLine\":\"COB: 0g\"},\"delta\":{\"absolute\":-4,\"elapsedMins\":4.999483333333333,\"interpolated\":false,\"mean5MinsAgo\":69,\"mgdl\":-4,\"scaled\":-0.2,\"display\":\"-0.2\",\"previous\":{\"mean\":69,\"last\":69,\"mills\":1557613221946,\"sgvs\":[{\"mgdl\":69,\"mills\":1557613221946,\"device\":\"MIAOMIAO\",\"direction\":\"Flat\",\"filtered\":92588,\"unfiltered\":92588,\"noise\":1,\"rssi\":100}]}}}";
         String propjson = http.getString();
-        auto propJSONerr = deserializeJson(JSONdoc, propjson);
+        // remove any non text characters (just for sure)
+        for(int i=0; i<propjson.length(); i++) {
+          // Serial.print(propjson.charAt(i), DEC); Serial.print(" = "); Serial.println(propjson.charAt(i));
+          if(propjson.charAt(i)<32 /* || propjson.charAt(i)=='\\' */) {
+            propjson.setCharAt(i, 32);
+          }
+        }
+        // propjson.replace("\\n"," ");
+        // invalid Unicode character defined by Ascensia Diabetes Care Bluetooth Glucose Meter
+        // ArduinoJSON does not accept any unicode surrogate pairs like \u0032 or \u0000
+        propjson.replace("\\u0000"," ");
+        propjson.replace("\\u0032"," ");
+        DeserializationError propJSONerr = deserializeJson(JSONdoc, propjson);
         if(propJSONerr) {
           err=1003; // "JSON2 parsing failed"
           addErrorLog(err);
@@ -1022,6 +1038,7 @@ void handleAlarmsInfoLine(struct NSinfo *ns) {
   Serial.print("Alarm time difference = "); Serial.print(alarmDifSec); Serial.println(" sec");
   Serial.print("Snooze time difference = "); Serial.print(snoozeDifSec); Serial.println(" sec");
   char tmpStr[10];
+  M5.Lcd.setTextDatum(TL_DATUM);
   if( snoozeDifSec<cfg.snooze_timeout*60 ) {
     sprintf(tmpStr, "%i", (cfg.snooze_timeout*60-snoozeDifSec+59)/60);
     if(dispPage<MAX_PAGE)
@@ -1150,7 +1167,22 @@ void drawLogWarningIcon() {
       M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
 }
 
-void update_glycemia() {
+void drawSegment(int x, int y, int r1, int r2, float a, int col)
+{
+  a = (a / 57.2958) - 1.57; 
+  float a1 = a-1.57,
+      a2 = a+1.57,
+      x1 = x + (cos(a1) * r1),
+      y1 = y + (sin(a1) * r1),
+      x2 = x + (cos(a2) * r1),
+      y2 = y + (sin(a2) * r1),
+      x3 = x + (cos(a) * r2),
+      y3 = y + (sin(a) * r2);
+      
+  M5.Lcd.fillTriangle(x1,y1,x2,y2,x3,y3,col);
+}
+
+void draw_page() {
   char tmpstr[255];
   
   M5.Lcd.setTextDatum(TL_DATUM);
@@ -1163,9 +1195,8 @@ void update_glycemia() {
       // if there was an error, then clear whole screen, otherwise only graphic updated part
       // M5.Lcd.fillScreen(BLACK);
       // M5.Lcd.fillRect(230, 110, 90, 100, TFT_BLACK);
-      // M5.Lcd.drawBitmap(242, 130, 64, 48, (uint16_t *)WiFi_symbol);
       
-      readNightscout(cfg.url, cfg.token, &ns);
+      // readNightscout(cfg.url, cfg.token, &ns);
 
       M5.Lcd.setFreeFont(FSSB12);
       M5.Lcd.setTextSize(1);
@@ -1182,7 +1213,13 @@ void update_glycemia() {
         if(getLocalTime(&timeinfo)) {
           // sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday, timeinfo.tm_mon+1);  
           // timeinfo.tm_mday=24; timeinfo.tm_mon=11;
-          sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mday, timeinfo.tm_mon+1);  
+          switch(cfg.date_format) {
+            case 1:
+              sprintf(datetimeStr, "%02d:%02d  %d/%d  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mon+1, timeinfo.tm_mday);
+              break;
+            default:
+              sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mday, timeinfo.tm_mon+1);  
+          }
         } else {
           // strcpy(datetimeStr, "??:??:??");
           strcpy(datetimeStr, "??:??");
@@ -1356,7 +1393,7 @@ void update_glycemia() {
     break;
     
     case 1: {
-      readNightscout(cfg.url, cfg.token, &ns);
+      // readNightscout(cfg.url, cfg.token, &ns);
       
       uint16_t glColor = TFT_GREEN;
       if(ns.sensSgv<cfg.yellow_low || ns.sensSgv>cfg.yellow_high) {
@@ -1437,6 +1474,244 @@ void update_glycemia() {
     }
     break;
    
+    case 2: {
+      // calculate SGV color
+      uint16_t glColor = TFT_GREEN;
+      if(ns.sensSgv<cfg.yellow_low || ns.sensSgv>cfg.yellow_high) {
+        glColor=TFT_YELLOW; // warning is YELLOW
+      }
+      if(ns.sensSgv<cfg.red_low || ns.sensSgv>cfg.red_high) {
+        glColor=TFT_RED; // alert is RED
+      }
+
+      // display SGV
+      sprintf(tmpstr, "Glyk: %4.1f %s", ns.sensSgv, ns.sensDir);
+      Serial.println(tmpstr);
+      M5.Lcd.setTextSize(1);
+      M5.Lcd.setTextDatum(TL_DATUM);
+      M5.Lcd.setTextColor(glColor, TFT_BLACK);
+      char sensSgvStr[30];
+      int smaller_font = 0;
+      if( cfg.show_mgdl ) {
+        if(ns.sensSgvMgDl<100) {
+          sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
+          M5.Lcd.setFreeFont(FSSB24);
+        } else {
+          sprintf(sensSgvStr, "%3.0f", ns.sensSgvMgDl);
+          M5.Lcd.setFreeFont(FSSB24);
+        }
+      } else {
+        if(ns.sensSgv<10) {
+          sprintf(sensSgvStr, "%3.1f", ns.sensSgv);
+          M5.Lcd.setFreeFont(FSSB24);
+        } else {
+          sprintf(sensSgvStr, "%4.1f", ns.sensSgv);
+          M5.Lcd.setFreeFont(FSSB24); //18
+        }
+      }
+      M5.Lcd.fillRect(0, 0, 100, 40, TFT_BLACK);
+      M5.Lcd.drawString(sensSgvStr, 0, 0, GFXFF);
+
+      // display DELTA
+      M5.Lcd.setTextDatum(TR_DATUM);
+      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      M5.Lcd.fillRect(220, 0, 100, 40, TFT_BLACK);
+      M5.Lcd.drawString(ns.delta_display, 319, 0, GFXFF);
+
+      // get time - need update
+      char datetimeStr[30];
+      struct tm timeinfo;
+      if(cfg.show_current_time) {
+        if(getLocalTime(&timeinfo)) {
+          sprintf(datetimeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);  
+        } else {
+          strcpy(datetimeStr, "??:??");
+        }
+      } else {
+        sprintf(datetimeStr, "%02d:%02d", ns.sensTm.tm_hour, ns.sensTm.tm_min);
+      }
+          
+      // calculate sensor time difference
+      int sensorDifSec=0;
+      if(!getLocalTime(&timeinfo)){
+        sensorDifSec=24*60*60; // too much
+      } else {
+        Serial.print("Local time: "); Serial.print(timeinfo.tm_hour); Serial.print(":"); Serial.print(timeinfo.tm_min); Serial.print(":"); Serial.print(timeinfo.tm_sec); Serial.print(" DST "); Serial.println(timeinfo.tm_isdst);
+        sensorDifSec=difftime(mktime(&timeinfo), ns.sensTime);
+      }
+      Serial.print("Sensor time difference = "); Serial.print(sensorDifSec); Serial.println(" sec");
+      unsigned int sensorDifMin = (sensorDifSec+30)/60;
+      uint16_t tdColor = TFT_LIGHTGREY;
+      if(sensorDifMin>5) {
+        tdColor = TFT_WHITE;
+        if(sensorDifMin>15) {
+          tdColor = TFT_RED;
+        }
+      }
+      // display time since last valid data
+      M5.Lcd.fillRoundRect(0, 44, 68, 22, 7, tdColor);
+      M5.Lcd.setTextSize(1);
+      M5.Lcd.setFreeFont(FSS9);
+      M5.Lcd.setTextDatum(MC_DATUM);
+      M5.Lcd.setTextColor(TFT_BLACK, tdColor);
+      if(sensorDifMin>99) {
+        M5.Lcd.drawString("Err min", 34, 53, GFXFF);
+      } else {
+        M5.Lcd.drawString(String(sensorDifMin)+" min", 34, 53, GFXFF);
+      }
+
+      // draw temperature
+      float tmprc=dht12.readTemperature(cfg.temperature_unit);
+      // Serial.print("tmprc="); Serial.println(tmprc);
+      if(tmprc!=float(0.01) && tmprc!=float(0.02) && tmprc!=float(0.03)) { // not an error
+        M5.Lcd.setTextDatum(BL_DATUM);
+        M5.Lcd.setFreeFont(FSS12); // CF_RT24
+        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        String tmprcStr=String(tmprc, 1);
+        int tw=M5.Lcd.textWidth(tmprcStr);
+        M5.Lcd.fillRect(0, 180, 88, 30, TFT_BLACK);
+        M5.Lcd.drawString(tmprcStr, 7, 210, GFXFF);
+        M5.Lcd.setFreeFont(FSS9);
+        int ow=M5.Lcd.textWidth("o");
+        M5.Lcd.drawString("o", 7+tw+2, 199, GFXFF);
+        M5.Lcd.setFreeFont(FSS12);
+        switch(cfg.temperature_unit) {
+          case 1:
+            M5.Lcd.drawString("C", 7+tw+ow+4, 210, GFXFF);
+            break;
+          case 2:
+            M5.Lcd.drawString("K", 7+tw+ow+4, 210, GFXFF);
+            break;
+          case 3:
+            M5.Lcd.drawString("F", 7+tw+ow+4, 210, GFXFF);
+            break;
+        }
+      }
+      
+      // display humidity
+      float humid=dht12.readHumidity();
+      // Serial.print("humid="); Serial.println(humid);
+      if(humid!=float(0.01) && humid!=float(0.02) && humid!=float(0.03)) { // not an error
+        M5.Lcd.setTextDatum(BR_DATUM);
+        M5.Lcd.setFreeFont(FSS12);
+        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        String humidStr=String(humid, 0);
+        humidStr += "%";
+        M5.Lcd.fillRect(250, 185, 70, 25, TFT_BLACK);
+        M5.Lcd.drawString(humidStr, 310, 210, GFXFF);
+      }
+
+      // draw clock
+      float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;    // Saved H, M, S x & y multipliers
+      float sdeg=0, mdeg=0, hdeg=0;
+      uint16_t x0=0, x1=0, yy0=0, yy1=0;
+    
+      uint8_t hh=timeinfo.tm_hour, mm=timeinfo.tm_min, ss=timeinfo.tm_sec;  // Get current time
+
+      // Draw clock face
+      M5.Lcd.fillCircle(160, 110, 98, glColor);
+      M5.Lcd.fillCircle(160, 110, 92, TFT_BLACK);
+    
+      // Draw 12 lines
+      for(int i = 0; i<360; i+= 30) {
+        sx = cos((i-90)*0.0174532925);
+        sy = sin((i-90)*0.0174532925);
+        x0 = sx*94+160;
+        yy0 = sy*94+110;
+        x1 = sx*80+160;
+        yy1 = sy*80+110;
+    
+        M5.Lcd.drawLine(x0, yy0, x1, yy1, glColor);
+      }
+      
+      // Draw 60 dots
+      for(int i = 0; i<360; i+= 6) {
+        sx = cos((i-90)*0.0174532925);
+        sy = sin((i-90)*0.0174532925);
+        x0 = sx*82+160;
+        yy0 = sy*82+110;
+        // Draw minute markers
+        M5.Lcd.drawPixel(x0, yy0, TFT_WHITE);
+        
+        // Draw main quadrant dots
+        if(i==0 || i==180) M5.Lcd.fillCircle(x0, yy0, 2, TFT_WHITE);
+        if(i==90 || i==270) M5.Lcd.fillCircle(x0, yy0, 2, TFT_WHITE);
+      }
+    
+      M5.Lcd.fillCircle(160, 110, 3, TFT_WHITE);
+
+      // draw day
+      M5.Lcd.drawRoundRect(182, 97, 36, 26, 7, TFT_LIGHTGREY);
+      M5.Lcd.setTextDatum(MC_DATUM);
+      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      M5.Lcd.setFreeFont(FSSB9);
+      M5.Lcd.drawString(String(timeinfo.tm_mday), 200, 108, GFXFF);
+    
+      // draw name
+      M5.Lcd.setTextDatum(MC_DATUM);
+      M5.Lcd.setFreeFont(FSSB9);
+      M5.Lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      M5.Lcd.drawString(cfg.userName, 160, 145, GFXFF);
+  
+      // Pre-compute hand degrees, x & y coords for a fast screen update
+      sdeg = ss*6;                  // 0-59 -> 0-354
+      mdeg = mm*6+sdeg*0.01666667;  // 0-59 -> 0-360 - includes seconds
+      hdeg = hh*30+mdeg*0.0833333;  // 0-11 -> 0-360 - includes minutes and seconds
+      hx = cos((hdeg-90)*0.0174532925);    
+      hy = sin((hdeg-90)*0.0174532925);
+      mx = cos((mdeg-90)*0.0174532925);    
+      my = sin((mdeg-90)*0.0174532925);
+      sx = cos((sdeg-90)*0.0174532925);    
+      sy = sin((sdeg-90)*0.0174532925);
+
+      if (ss==0 || initial) {
+        initial = 0;
+        // Erase hour and minute hand positions every minute
+        M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_BLACK);
+        M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_BLACK);
+        M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_BLACK);
+        M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_BLACK);
+        M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_BLACK);
+        ohx = hx*52+160;    
+        ohy = hy*52+110;
+        M5.Lcd.drawLine(omx, omy, 160, 110, TFT_BLACK);
+        omx = mx*74+160;    
+        omy = my*74+110;
+      }
+  
+      // Redraw new hand positions, hour and minute hands not erased here to avoid flicker
+      M5.Lcd.drawLine(osx, osy, 160, 110, TFT_BLACK);
+      osx = sx*78+160;    
+      osy = sy*78+110;
+      M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_WHITE);
+      M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_WHITE);
+      M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_WHITE);
+      M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_WHITE);
+      M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_WHITE);
+      M5.Lcd.drawLine(omx, omy, 160, 110, TFT_WHITE);
+      M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
+  
+      M5.Lcd.fillCircle(160, 110, 3, TFT_RED);      
+
+      // draw angle arrow  
+      int ay=0;
+      if(ns.arrowAngle>=45)
+        ay=4;
+      else
+        if(ns.arrowAngle>-45)
+          ay=18;
+        else
+          ay=30;
+      M5.Lcd.fillRect(262, 80, 58, 60, TFT_BLACK);
+      if(ns.arrowAngle!=180)
+        drawArrow(280, ay+90, 10, ns.arrowAngle+85, 28, 28, glColor);
+        
+      handleAlarmsInfoLine(&ns);
+      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
+      drawLogWarningIcon();
+    }
+    break;
+    
     case MAX_PAGE: {
       // display error log
       char tmpStr[32];
@@ -1485,6 +1760,8 @@ void update_glycemia() {
         M5.Lcd.drawString(tmpStr, 0, 20+err_log_ptr*18, GFXFF);
       }
       handleAlarmsInfoLine(&ns);
+      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
+      drawLogWarningIcon();
     }
     break;
   }
@@ -1497,7 +1774,11 @@ void loop(){
 
   // update glycemia every 15s
   if(millis()-msCount>15000) {
-    update_glycemia();
+    /* if(dispPage==2)
+      M5.Lcd.drawLine(osx, osy, 160, 111, TFT_BLACK); // erase seconds hand while updating data
+    */
+    readNightscout(cfg.url, cfg.token, &ns);
+    draw_page();
     msCount = millis();  
     Serial.print("msCount = "); Serial.println(msCount);
   } else {
@@ -1527,7 +1808,13 @@ void loop(){
       M5.Lcd.setTextSize(1);
       M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
       if(getLocalTime(&localTimeInfo)) {
-        sprintf(localTimeStr, "%02d:%02d  %d.%d.  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mday, localTimeInfo.tm_mon+1);  
+        switch(cfg.date_format) {
+          case 1:
+            sprintf(localTimeStr, "%02d:%02d  %d/%d  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mon+1, localTimeInfo.tm_mday);
+            break;
+          default:
+            sprintf(localTimeStr, "%02d:%02d  %d.%d.  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mday, localTimeInfo.tm_mon+1);
+        }
       } else {
         strcpy(localTimeStr, "??:??");
         lastMin = 61;
@@ -1537,6 +1824,81 @@ void loop(){
         lastMin=localTimeInfo.tm_min;
         M5.Lcd.drawString(localTimeStr, 0, 0, GFXFF);
       }
+    }
+    if(dispPage==2) {
+      if(getLocalTime(&localTimeInfo)) {
+        // sprintf(localTimeStr, "%02d:%02d:%02d", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_sec);
+      } else {
+        lastMin = 61;
+        lastSec = 61;
+      }
+      if(lastMin!=localTimeInfo.tm_min || lastSec!=localTimeInfo.tm_sec) {
+        lastSec=localTimeInfo.tm_sec;
+        lastMin=localTimeInfo.tm_min;
+        
+        float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;    // Saved H, M, S x & y multipliers
+        float sdeg=0, mdeg=0, hdeg=0;
+      
+        uint8_t hh=localTimeInfo.tm_hour, mm=localTimeInfo.tm_min, ss=localTimeInfo.tm_sec;  // Get current time
+        
+        // Pre-compute hand degrees, x & y coords for a fast screen update
+        sdeg = ss*6;                  // 0-59 -> 0-354
+        mdeg = mm*6+sdeg*0.01666667;  // 0-59 -> 0-360 - includes seconds
+        hdeg = hh*30+mdeg*0.0833333;  // 0-11 -> 0-360 - includes minutes and seconds
+        hx = cos((hdeg-90)*0.0174532925);    
+        hy = sin((hdeg-90)*0.0174532925);
+        mx = cos((mdeg-90)*0.0174532925);    
+        my = sin((mdeg-90)*0.0174532925);
+        sx = cos((sdeg-90)*0.0174532925);    
+        sy = sin((sdeg-90)*0.0174532925);
+  
+        if (ss==0 || initial) {
+          initial = 0;
+          // Erase hour and minute hand positions every minute
+          M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_BLACK);
+          M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_BLACK);
+          M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_BLACK);
+          M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_BLACK);
+          M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_BLACK);
+          ohx = hx*52+160;    
+          ohy = hy*52+110;
+          M5.Lcd.drawLine(omx, omy, 160, 110, TFT_BLACK);
+          omx = mx*74+160;    
+          omy = my*74+110;
+        }
+
+        // erase old seconds hand position
+        M5.Lcd.drawLine(osx, osy, 160, 110, TFT_BLACK);
+    
+        // draw day
+        M5.Lcd.drawRoundRect(182, 97, 36, 26, 7, TFT_LIGHTGREY);
+        M5.Lcd.setTextDatum(MC_DATUM);
+        M5.Lcd.setFreeFont(FSSB9);
+        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        M5.Lcd.drawString(String(localTimeInfo.tm_mday), 200, 108, GFXFF);
+     
+        // draw name
+        M5.Lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Lcd.drawString(cfg.userName, 160, 145, GFXFF);
+    
+        // draw digital time
+        // M5.Lcd.drawString(localTimeStr, 160, 75, GFXFF);
+        
+        // Redraw new hand positions, hour and minute hands not erased here to avoid flicker
+        osx = sx*78+160;    
+        osy = sy*78+110;
+        // M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
+        M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_WHITE);
+        M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_WHITE);
+        M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_WHITE);
+        M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_WHITE);
+        M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_WHITE);
+        M5.Lcd.drawLine(omx, omy, 160, 110, TFT_WHITE);
+        M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
+    
+        M5.Lcd.fillCircle(160, 110, 3, TFT_RED);
+      }
+      
     }
   }
 
