@@ -1,5 +1,13 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
 /*  M5Stack Nightscout monitor
-    Copyright (C) 2018, 2019 Martin Lukasek <martin@lukasek.cz>
+    Copyright (C) 2019 Johan Degraeve
+
+    Connects to xdripswift via Bluetooth. Receives readings and slope. Shows both on screen.
+    Settings can be configured via xdripswift.
     
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -13,16 +21,15 @@
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>. 
+
+    Original code by Martin Lukasek <martin@lukasek.cz>
     
     This software uses some 3rd party libraries:
     IniFile by Steve Marple <stevemarple@googlemail.com> (GNU LGPL v2.1)
     ArduinoJson by Benoit BLANCHON (MIT License) 
     IoT Icon Set by Artur Funk (GPL v3)
-    DHT12 by Bobadas (Public domain)
     Additions to the code:
     Peter Leimbach (Nightscout token)
-    Patrick Sonnerat (Dexcom Sugarmate connection)
-    Sulka Haro (Nightscout API queries help)
 */
 
 #include <M5Stack.h>
@@ -37,37 +44,25 @@
 #include "Free_Fonts.h"
 #include "IniFile.h"
 #include "M5NSconfig.h"
-#include "DHT12.h"
-#include <Wire.h>     //The DHT12 uses I2C comunication.
-DHT12 dht12;          //Preset scale CELSIUS and ID 0x5c.
+#include <cstring>
+#include <string>
 
-// extern const unsigned char alarmSndData[];
 
-extern const unsigned char sun_icon16x16[];
-extern const unsigned char clock_icon16x16[];
-extern const unsigned char timer_icon16x16[];
-// extern const unsigned char powerbutton_icon16x16[];
-extern const unsigned char door_icon16x16[];
-extern const unsigned char warning_icon16x16[];
-extern const unsigned char wifi1_icon16x16[];
+// needed to act as BLE server
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+// if debugLogging then there's more logging, haha
+const bool debugLogging = false;
+
 extern const unsigned char wifi2_icon16x16[];
-
-extern const unsigned char bat0_icon16x16[];
-extern const unsigned char bat1_icon16x16[];
-extern const unsigned char bat2_icon16x16[];
-extern const unsigned char bat3_icon16x16[];
-extern const unsigned char bat4_icon16x16[];
-extern const unsigned char plug_icon16x16[];
 
 Preferences preferences;
 tConfig cfg;
 
-const char* ntpServer = "pool.ntp.org"; // "time.nist.gov", "time.google.com"
-struct tm localTimeInfo;
-int MAX_TIME_RETRY = 30;
-int lastSec = 61;
-int lastMin = 61;
-char localTimeStr[30];
+const char * ntpServer = "pool.ntp.org"; // "time.nist.gov", "time.google.com"
 
 struct err_log_item {
   struct tm err_time;
@@ -76,15 +71,10 @@ struct err_log_item {
 int err_log_ptr = 0;
 int err_log_count = 0;
 
-int dispPage = 0;
-#define MAX_PAGE 3
-// icon positions for the first page - WiFi/log, Snooze, Battery
+int dispPage = 1;
+#define MAX_PAGE 2
 int icon_xpos[3] = {144, 144+18, 144+2*18};
 int icon_ypos[3] = {0, 0, 0};
-
-// analog clock global variables
-uint16_t osx=120, osy=120, omx=120, omy=120, ohx=120, ohy=120;  // Saved H, M, S x & y coords
-boolean initial = 1;
 
 #ifndef min
   #define min(a,b) (((a) < (b)) ? (a) : (b))
@@ -92,50 +82,162 @@ boolean initial = 1;
 
 WiFiMulti WiFiMulti;
 unsigned long msCount;
-unsigned long msCountLog;
 unsigned long msStart;
 static uint8_t lcdBrightness = 10;
 static char *iniFilename = "/M5NS.INI";
+static uint16_t textColor = TFT_WHITE;
+
+// milliseconds since start of last call to connectToWiFiIfNightScoutUrlExists from within nightscout check
+unsigned long milliSecondsSinceLastCallToWifiConnectFromWithinNightScoutcheck = 0;
+
+const unsigned long minimumTimeBetweenTwoCallsToWifiConnectFromWithinNightScoutcheck = 60000;
+
+//timestamp of latest nightscout reading, initially 0
+unsigned long timeStampLatestBgReadingInSecondsUTC = 0;
+
+// to temporary store the latest shown string, each refresh, it will be checked if it has changed and if not then no redraw, otherwise the screen flickers annoyingly
+const int senssgvStringLength = 30;
+char previousSensSgvStr[senssgvStringLength];
 
 DynamicJsonDocument JSONdoc(16384);
-time_t lastAlarmTime = 0;
-time_t lastSnoozeTime = 0;
-static uint8_t music_data[25000]; // 5s in sample rate 5000 samp/s
 
 struct NSinfo {
-  char sensDev[64];
   uint64_t rawtime = 0;
-  time_t sensTime = 0;
+  time_t sensTime = 0; /// time in seconds
   struct tm sensTm;
   char sensDir[32];
   float sensSgvMgDl = 0;
   float sensSgv = 0;
-  float last10sgv[10];
-  bool is_xDrip = 0;  
-  bool is_Sugarmate = 0;  
   int arrowAngle = 180;
-  float iob = 0;
-  char iob_display[16];
-  char iob_displayLine[16];
-  float cob = 0;
-  char cob_display[16];
-  char cob_displayLine[16];
-  int delta_absolute = 0;
-  float delta_elapsedMins = 0;
-  bool delta_interpolated = 0;
-  int delta_mean5MinsAgo = 0;
-  int delta_mgdl = 0;
-  float delta_scaled = 0;
-  char delta_display[16];
-  char loop_display_symbol = '?';
-  char loop_display_code[16];
-  char loop_display_label[16];
-  char basal_display[16];
-  float basal_current = 0;
-  float basal_tempbasal = 0;
-  float basal_combobolusbasal = 0;
-  float basal_totalbasal = 0;
 } ns;
+
+int previousArrowAngle = 180;
+
+// if it's not an M5StackC, then it's a normal M5Stack
+bool isM5StickC = false;
+
+//////// BLE PROPERTIES  ///////
+
+// used for creating random password
+char *letters = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+BLEServer *pServer = NULL;
+BLECharacteristic * pRxTxCharacteristic;
+BLEService *pService;
+bool bleDeviceConnected = false;
+uint8_t txValue = 0;
+
+// device name that BLE client will see when scanning
+const String BLE_DeviceName = "M5Stack";
+
+// service and characteristic uuid for ble
+// characteristic will be used for read and write
+const String BLE_SERVICE_UUID = "AF6E5F78-706A-43FB-B1F4-C27D7D5C762F";
+const String BLE_CHARACTERISTIC_UUID = "6D810E9F-0983-4030-BDA7-C7C9A6A19C1C";
+
+// is BLE communication needed or not ? always true. Could be used in future, for instance by setting to false in the  config file, ble would never start up and so save energy
+const bool useBLE = true;
+
+// maximum number of bytes to send in one BLE packet
+const int maxBytesInOneBLEPacket = 20;
+
+// will be set to true if we find a blepassword in the ini file
+bool useConfiguredBlePassword = false;
+
+// is authentication done or not, in case not authenticated, we won't accept any reading or anything else
+bool bleAuthenticated = false;
+
+// will be set to false as soon as BLE setup is fully finished
+bool initialBLEStartUpOnGoing = true;
+
+///// as we may work without wifi, we need to be able to set the time, we can use BLE client for that. Following variable tell us if we've already retrieved the time from the server
+///// and also the moment when retrieved is noted as the number of milliseconds since start 
+///// we retrieve the local time, so we don't need to care about timezone, daylight savings etc.
+
+// time difference in seconds, between local time and utc time - to get UTC time, do localTimeStampInSecondsRetrievedFromBLEClient - diffBetweenLocalTimeAndUTCTime
+unsigned long diffBetweenLocalTimeAndUTCTime = 0;
+
+// local time, in seconds since 1.1.1970 retrieved from client - this value remains fixed once retrieved. Value 0 means not yet retrieved.
+unsigned long localTimeStampInSecondsRetrievedFromBLEClient = 0;
+
+// time in milliseconds since start of the sketch, when timeStampInSecondsRetrievedFromBLEClient was received
+unsigned long milliSecondsSinceRetrievalTimeStampInSecondsRetrievedFromBLEClient = 0;
+
+// will hold value received from BLE client, defined here once to avoid heap fragmentation
+byte rxValueAsByteArray[maxBytesInOneBLEPacket];
+
+// when receiving wifi names and passwords, xdrip will split longer strings in multiple packets. The first packet will have as fourth byte (ie index 3), 
+// the number of the wifi and/or password being changed, this needs to be stored as a global variable, because only the first packet has that information
+int indexForWifiNamesAndPasswords = 0;
+
+////// NightScout properties
+
+char NSurl[128];
+
+/////// FUNCTIONS
+
+// local time in seconds since 1.1.1970 , if return value is 0, then failed
+unsigned long getLocalTimeInSeconds() {
+
+  // Start by trying timestamp received from BLE client, if so calculate it and return if not get it from ble server
+  // it is only after having passed here two times, that this can succeed, if localTimeStampInSecondsRetrievedFromBLEClient = 0, and ble is connected then we'll get the time
+  if (localTimeStampInSecondsRetrievedFromBLEClient > 0L) {
+    return localTimeStampInSecondsRetrievedFromBLEClient + (millis() - milliSecondsSinceRetrievalTimeStampInSecondsRetrievedFromBLEClient)/1000;
+  }
+
+  Serial.println("localTimeStampInSecondsRetrievedFromBLEClient <= 0");
+
+  /// using ble, only if connected and authenticated, ask client to send time
+  if (bleDeviceConnected && bleAuthenticated && pRxTxCharacteristic != NULL) {
+    Serial.println(F("Sending opcode readTimeStampRx to client"));
+    sendTextToBLEClient("", 0x11, 0);
+  }
+
+
+  /// next try using standard Arduino methods, ie ntp server
+  tm  dateandtime;
+
+  if (getLocalTime(&dateandtime)) {
+
+    if (debugLogging) {
+      Serial.println(F("getLocalTime is true"));
+    }
+    
+    time_t utcTimeInSeconds = mktime(&dateandtime);
+
+    if (debugLogging) {Serial.print("in getLocalTimeInSeconds, utcTimeInSeconds = ");Serial.println(utcTimeInSeconds);}
+
+    // if diffBetweenLocalTimeAndUTCTime still 0, then set it now, based on time_zone and dst in config
+    if (diffBetweenLocalTimeAndUTCTime == 0) {
+      // we assume here time_zone and dst are correctly set, which should be the case as getLocalTime was working ok
+      diffBetweenLocalTimeAndUTCTime = (unsigned long)((long)cfg.timeZone + (long)cfg.dst);
+    }
+    
+    return (unsigned long) utcTimeInSeconds + diffBetweenLocalTimeAndUTCTime;
+    
+  } else {
+    if (debugLogging) {Serial.println("getLocalTime is false");}
+  }
+
+  /// try setting up ntp , this will only work if wifi is on, after that, no matter if succeeded or not we will continue trying to get time from ble client
+  /// using ntp
+  if((WiFiMulti.run() == WL_CONNECTED)) {
+    if (debugLogging) {Serial.println("calling configtime");}
+    configTime(cfg.timeZone, cfg.dst, ntpServer, "time.nist.gov", "time.google.com");
+  }
+
+  return 0;  
+}
+
+// utc time in seconds since 1.1.1970 , if return value is 0, then failed
+unsigned long getUTCTimeInSeconds() {
+  unsigned long localTimeInSeconds = getLocalTimeInSeconds();
+  if (localTimeInSeconds > 0) {
+    return localTimeInSeconds - diffBetweenLocalTimeAndUTCTime;
+  } else {
+    return 0;
+  }
+}
 
 void setPageIconPos(int page) {
   switch(page) {
@@ -155,143 +257,14 @@ void setPageIconPos(int page) {
       icon_ypos[1] = 0;
       icon_ypos[2] = 18; // 220;
       break;
-    case 2:
-      icon_xpos[0] = 0+18;
-      icon_xpos[1] = 0+18;
-      icon_xpos[2] = 0+18;
-      icon_ypos[0] = 110-18-9;
-      icon_ypos[1] = 110-18+9;
-      icon_ypos[2] = 110-18+27;
-      break;
     default:
-      icon_xpos[0] = 266;
-      icon_xpos[1] = 266+18;
-      icon_xpos[2] = 266+2*18;
+      icon_xpos[0] = 144;
+      icon_xpos[1] = 144+18;
+      icon_xpos[2] = 144+2*18;
       icon_ypos[0] = 0;
       icon_ypos[1] = 0;
       icon_ypos[2] = 0;
       break;
-  }
-}
-
-void addErrorLog(int code){
-  if(err_log_ptr>9) {
-    for(int i=0; i<9; i++) {
-      err_log[i].err_time=err_log[i+1].err_time;
-      err_log[i].err_code=err_log[i+1].err_code;
-    }
-    err_log_ptr=9;
-  }
-  getLocalTime(&err_log[err_log_ptr].err_time);
-  err_log[err_log_ptr].err_code=code;
-  err_log_ptr++;
-  err_log_count++;
-}
-
-void startupLogo() {
-    static uint8_t brightness, pre_brightness;
-    M5.Lcd.setBrightness(0);
-    if(cfg.bootPic[0]==0) {
-      // M5.Lcd.pushImage(0, 0, 320, 240, (uint16_t *)gImage_logoM5);
-      M5.Lcd.drawString("M5 Stack", 120, 60, GFXFF);
-      M5.Lcd.drawString("Nightscout monitor", 60, 80, GFXFF);
-      M5.Lcd.drawString("(c) 2019 Martin Lukasek", 20, 120, GFXFF);
-    } else {
-      M5.Lcd.drawJpgFile(SD, cfg.bootPic);
-    }
-    M5.Lcd.setBrightness(100);
-    M5.update();
-    // M5.Speaker.playMusic(m5stack_startup_music,25000);
-    /*
-    int avg=0;
-    for(uint16_t i=0; i<40000; i++) {
-      avg+=m5stack_startup_music[i];
-      if(i%4 == 3) {
-        music_data[i/4]=avg/4;
-        avg=0;
-      }
-    }
-    play_music_data(10000, 100);
-
-    for(int i=0; i>=100; i++) {
-        M5.Lcd.setBrightness(i);
-        delay(2);
-    }
-    */
-}
-
-void printLocalTime() {
-  if(!getLocalTime(&localTimeInfo)){
-    Serial.println("Failed to obtain time");
-    M5.Lcd.println("Failed to obtain time");
-    return;
-  }
-  Serial.println(&localTimeInfo, "%A, %B %d %Y %H:%M:%S");
-  M5.Lcd.println(&localTimeInfo, "%A, %B %d %Y %H:%M:%S");
-}
-
-void play_music_data(uint32_t data_length, uint8_t volume) {
-  uint8_t vol;
-  if( volume>100 )
-    vol=1;
-  else
-    vol=101-volume;
-  if(vol != 101) {
-    ledcSetup(TONE_PIN_CHANNEL, 0, 13);
-    ledcAttachPin(SPEAKER_PIN, TONE_PIN_CHANNEL);
-    delay(10);
-    for(int i=0; i<data_length; i++) {
-      dacWrite(SPEAKER_PIN, music_data[i]/vol);
-      delayMicroseconds(194); // 200 = 1 000 000 microseconds / sample rate 5000
-    }
-    /* takes too long
-    // slowly set DAC to zero from the last value
-    for(int t=music_data[data_length-1]; t>=0; t--) {
-      dacWrite(SPEAKER_PIN, t);
-      delay(2);
-    } */
-    for(int t = music_data[data_length - 1] / vol; t >= 0; t--) {
-      dacWrite(SPEAKER_PIN, t);
-      delay(2);
-    }
-    // dacWrite(SPEAKER_PIN, 0);
-    // delay(10);
-    ledcAttachPin(SPEAKER_PIN, TONE_PIN_CHANNEL);
-    ledcWriteTone(TONE_PIN_CHANNEL, 0);
-    CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_XPD_DAC | RTC_IO_PDAC1_DAC_XPD_FORCE);
-  }
-}
-
-void play_tone(uint16_t frequency, uint32_t duration, uint8_t volume) {
-  // Serial.print("start fill music data "); Serial.println(millis());
-  uint32_t data_length = 5000;
-  if( duration*5 < data_length )
-    data_length = duration*5;
-  float interval = 2*M_PI*float(frequency)/float(5000);
-  for (int i=0;i<data_length;i++) {
-    music_data[i]=127+126*sin(interval*i);
-  }
-  // Serial.print("finish fill music data "); Serial.println(millis());
-  play_music_data(data_length, volume);
-}    
-
-void sndAlarm() {
-    for(int j=0; j<6; j++) {
-      if( cfg.dev_mode )
-        play_tone(660, 400, 1);
-      else
-        play_tone(660, 400, cfg.alarm_volume);
-      delay(200);
-    }
-}
-
-void sndWarning() {
-  for(int j=0; j<3; j++) {
-    if( cfg.dev_mode )
-      play_tone(3000, 100, 1);
-    else
-      play_tone(3000, 100, cfg.warning_volume);
-    delay(300);
   }
 }
 
@@ -308,327 +281,476 @@ void drawIcon(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t color) {
   }
 }
 
-void buttons_test() {
-  if(M5.BtnA.wasPressed()) {
-    // M5.Lcd.printf("A");
-    Serial.printf("A");
-    // play_tone(1000, 10, 1);
-    // sndAlarm();
-    if(lcdBrightness==cfg.brightness1) 
-      lcdBrightness = cfg.brightness2;
-    else
-      if(lcdBrightness==cfg.brightness2) 
-        lcdBrightness = cfg.brightness3;
-      else
-        lcdBrightness = cfg.brightness1;
-    M5.Lcd.setBrightness(lcdBrightness);
-    // addErrorLog(500);
-  }
-  if(M5.BtnB.wasPressed()) {
-    // M5.Lcd.printf("B");
-    Serial.printf("B");
-    /*
-    play_tone(440, 100, 1);
-    delay(10);
-    play_tone(880, 100, 1);
-    delay(10);
-    play_tone(1760, 100, 1);
-    */
-    struct tm timeinfo;
-    if(!getLocalTime(&timeinfo)){
-      lastSnoozeTime=0;
-    } else {
-      lastSnoozeTime=mktime(&timeinfo);
-    }
-    M5.Lcd.fillRect(110, 220, 100, 20, TFT_WHITE);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setFreeFont(FSSB12);
-    M5.Lcd.setTextColor(TFT_BLACK, TFT_WHITE);
-    char tmpStr[10];
-    sprintf(tmpStr, "%i", cfg.snooze_timeout);
-    int txw=M5.Lcd.textWidth(tmpStr);
-    Serial.print("Set SNOOZE: "); Serial.println(tmpStr);
-    M5.Lcd.drawString(tmpStr, 159-txw/2, 220, GFXFF);
-    if(dispPage<MAX_PAGE)
-      drawIcon(icon_xpos[1], icon_ypos[1], (uint8_t*)clock_icon16x16, TFT_RED);
-  } 
-  
-  if(M5.BtnC.wasPressed()) {
-    // M5.Lcd.printf("C");
-    Serial.printf("C");
-    unsigned long btnCPressTime = millis();
-    long pwrOffTimeout = 4000;
-    int lastDispTime = pwrOffTimeout/1000;
-    int longPress = 0;
-    char tmpstr[32];
-    while(M5.BtnC.read()) {
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setFreeFont(FSSB12);
-      // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
-      // M5.Lcd.fillRect(0, 220, 320, 20, TFT_RED);
-      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-      int timeToPwrOff = (pwrOffTimeout - (millis()-btnCPressTime))/1000;
-      if((lastDispTime!=timeToPwrOff) && (millis()-btnCPressTime>800)) {
-        longPress = 1;
-        sprintf(tmpstr, "OFF in %1d   ", timeToPwrOff);
-        M5.Lcd.drawString(tmpstr, 210, 220, GFXFF);
-        lastDispTime=timeToPwrOff;
-      }
-      if(timeToPwrOff<=0) {
-        // play_tone(3000, 100, 1);
-        M5.setWakeupButton(BUTTON_C_PIN);
-        M5.powerOFF();
-      }
-      M5.update();
-    }
-    if(longPress) {
-      M5.Lcd.fillRect(210, 220, 110, 20, TFT_BLACK);
-      drawIcon(246, 220, (uint8_t*)door_icon16x16, TFT_LIGHTGREY);
-    } else {
-      dispPage++;
-      if(dispPage>MAX_PAGE)
-        dispPage = 0;
-      setPageIconPos(dispPage);
-      M5.Lcd.clear(BLACK);
-      // msCount = millis()-16000;
-      draw_page();
-      // play_tone(440, 100, 1);
-    }
-    /*
-    for (int i=0;i<25000;i++) {
-      music_data[i]=alarmSndData[i];
-    }
-    play_music_data(25000, 10); */
-  }
-}
+void connectToWiFiIfNightScoutUrlExists() {
 
-void wifi_connect() {
+  // check if nightscouturl exists, otherwise don't even try to connect
+  if ( sizeOfStringInCharArray(cfg.url, 64) == 0) {
+    return;
+  }
+
+  if((WiFiMulti.run() == WL_CONNECTED)) {
+    return;
+  }
+  
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
 
-  Serial.println("WiFi connect start");
-  M5.Lcd.println("WiFi connect start");
+  Serial.println(F("WiFi connect start"));
 
   // We start by connecting to a WiFi network
   for(int i=0; i<=9; i++) {
-    if((cfg.wlanssid[i][0]!=0) && (cfg.wlanpass[i][0]!=0))
+    if((cfg.wlanssid[i][0]!=0) && (cfg.wlanpass[i][0]!=0)) {
+      if (debugLogging) {
+        Serial.print(F("Adding access point "));Serial.print(cfg.wlanssid[i]);Serial.print(F(" with password "));Serial.println(cfg.wlanpass[i]);
+      }
       WiFiMulti.addAP(cfg.wlanssid[i], cfg.wlanpass[i]);
-  }
-
-  Serial.println();
-  M5.Lcd.println("");
-  Serial.print("Wait for WiFi... ");
-  M5.Lcd.print("Wait for WiFi... ");
-
-  while(WiFiMulti.run() != WL_CONNECTED) {
-      Serial.print(".");
-      M5.Lcd.print(".");
-      delay(500);
-  }
-
-  Serial.println("");
-  M5.Lcd.println("");
-  Serial.print("WiFi connected to SSID "); Serial.println(WiFi.SSID());
-  M5.Lcd.print("WiFi SSID "); M5.Lcd.println(WiFi.SSID());
-  Serial.println("IP address: ");
-  M5.Lcd.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  M5.Lcd.println(WiFi.localIP());
-
-  configTime(cfg.timeZone, cfg.dst, ntpServer, "time.nist.gov", "time.google.com");
-  delay(1000);
-  Serial.print("Waiting for time.");
-  int i = 0;
-  while(!getLocalTime(&localTimeInfo)) {
-    Serial.print(".");
-    delay(1000);
-    i++;
-    if (i > MAX_TIME_RETRY) {
-      Serial.print("Gave up waiting for time to have a valid value.");
-      break;
     }
   }
-  Serial.println();
-  printLocalTime();
 
-  Serial.println("Connection done");
-  M5.Lcd.println("Connection done");
-}
+  
+  Serial.println(F("Wait for WiFi... "));
 
-int8_t getBatteryLevel()
-{
-  Wire.beginTransmission(0x75);
-  Wire.write(0x78);
-  if (Wire.endTransmission(false) == 0
-   && Wire.requestFrom(0x75, 1)) {
-    int8_t bdata=Wire.read();
-    /* 
-    // write battery info to logfile.txt
-    File fileLog = SD.open("/logfile.txt", FILE_WRITE);    
-    if(!fileLog) {
-      Serial.println("Cannot write to logfile.txt");
-    } else {
-      int pos = fileLog.seek(fileLog.size());
-      struct tm timeinfo;
-      getLocalTime(&timeinfo);
-      fileLog.print(asctime(&timeinfo));
-      fileLog.print("   Battery level: "); fileLog.println(bdata, HEX);
-      fileLog.close();
-      Serial.print("Log file written: "); Serial.print(asctime(&timeinfo));
-    }
-    */
-    switch (bdata & 0xF0) {
-      case 0xE0: return 25;
-      case 0xC0: return 50;
-      case 0x80: return 75;
-      case 0x00: return 100;
-      default: return 0;
-    }
+  if (WiFiMulti.run() != WL_CONNECTED) {
+      Serial.println(F("Wifi not connected"));
+      yield();
+      return;
   }
-  return -1;
+
+  Serial.println(F(""));
+  Serial.println(F("WiFi connected to SSID ")); Serial.println(WiFi.SSID());
+
+  Serial.println(F(""));
+
+  Serial.println(F("Connection done"));
+
 }
 
 // the setup routine runs once when M5Stack starts up
 void setup() {
+
+    // initialize previousSensSgvStr
+    strcpy(previousSensSgvStr, "");
+    
     // initialize the M5Stack object
     M5.begin();
+
+    // set text color foreground, black background, always
+    M5.Lcd.setTextColor(textColor, TFT_BLACK);
+    
     // prevent button A "ghost" random presses
     Wire.begin();
     SD.begin();
     
-    // M5.Speaker.mute();
-
     // Lcd display
     M5.Lcd.setBrightness(100);
     M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(0, 0);//(0, 0, 1) for mini
+    M5.Lcd.setTextSize(2);// 1 for mini
     yield();
 
-    Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
+    Serial.print(F("Free Heap: ")); Serial.println(ESP.getFreeHeap());
 
     uint8_t cardType = SD.cardType();
 
     if(cardType == CARD_NONE){
-        Serial.println("No SD card attached");
-        M5.Lcd.println("No SD card attached");
-        while(1);
-    }
-
-    Serial.print("SD Card Type: ");
-    M5.Lcd.print("SD Card Type: ");
-    if(cardType == CARD_MMC){
-        Serial.println("MMC");
-        M5.Lcd.println("MMC");
-    } else if(cardType == CARD_SD){
-        Serial.println("SDSC");
-        M5.Lcd.println("SDSC");
-    } else if(cardType == CARD_SDHC){
-        Serial.println("SDHC");
-        M5.Lcd.println("SDHC");
+        Serial.println(F("No SD card attached"));
+        M5.Lcd.println(F("No SD card attached"));
     } else {
-        Serial.println("UNKNOWN");
-        M5.Lcd.println("UNKNOWN");
+      
+          readConfiguration(iniFilename, &cfg);
+          lcdBrightness = cfg.brightness1;
+          M5.Lcd.setBrightness(lcdBrightness);
+
+          if (sizeOfStringInCharArray(cfg.blepassword, 64) >0) {
+            useConfiguredBlePassword = true;
+          }
+          
+          yield();
+      
+          preferences.begin("M5StackNS", false);
+          if(preferences.getBool("SoftReset", false)) {
+            // no startup sound after soft reset and remove the SoftReset key
+            preferences.remove("SoftReset");
+          }
+          
+          preferences.end();
+      
+          delay(1000);
+          M5.Lcd.fillScreen(BLACK);
+      
+          M5.Lcd.setBrightness(lcdBrightness);
+          connectToWiFiIfNightScoutUrlExists();
+          yield();// seems to be to let the board to things in the background, probably related to calling connectToWiFiIfNightScoutUrlExists
+      
+          M5.Lcd.setBrightness(lcdBrightness);
+          M5.Lcd.fillScreen(BLACK);
+      
+          dispPage = 1;// default page is page with value large number
+          setPageIconPos(dispPage);
+          
+          // stat startup time
+          msStart = millis();
+          
+          // update glycemia now
+          msCount = msStart-16000L;
+
+          configureTargetServerAndUrl(cfg.url, cfg.token);
+
     }
 
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-    Serial.printf("SD Card Size: %llu MB\n", cardSize);
-    M5.Lcd.printf("SD Card Size: %llu MB\n", cardSize);
+    if (useBLE) {
+      Serial.println(F("Bluetooth is on, open the xdrip app on iOS device and scan for M5Stack"));
+      M5.Lcd.println(F("Bluetooth is on, open the xdrip app on iOS device and scan for M5Stack"));
+      setupBLE();
+    }
+}
 
-    readConfiguration(iniFilename, &cfg);
-    // strcpy(cfg.url, "https://sugarmate.io/api/v1/xxxxxx/latest.json");
-    // strcpy(cfg.url, "user.herokuapp.com"); 
-    // cfg.dev_mode = 1;
-    // cfg.show_mgdl = 1;
-    // cfg.sgv_only = 1;
-    // cfg.default_page = 2;
-    // strcpy(cfg.restart_at_time, "21:59");
-    // cfg.restart_at_logged_errors=3;
-    // cfg.show_COB_IOB = 0;
-    // cfg.snd_warning = 5.5;
-    // cfg.snd_alarm = 4.5;
-    // cfg.snd_warning_high = 9;
-    // cfg.snd_alarm_high = 14;
-    // cfg.alarm_volume = 0;
-    // cfg.warning_volume = 0;
-    // cfg.snd_warning_at_startup = 1;
-    // cfg.snd_alarm_at_startup = 1;
+int readNightscout() {
+
+  int err=0;
+    
+  if((WiFiMulti.run() == WL_CONNECTED)) {
+
+    Serial.println(F("In readNightscout"));
+
+    HTTPClient http;
+    char tmpstr[32];/// DELETE THIS OR CHECK FIRST IF DETAILED DEBUGGING IS ENABLED WITH EXTRA FLAG, TO AVOID THAT THIS GETS ALLOCATED EACH TIME AGAIN AND AGAIN
+
+    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
+    drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi2_icon16x16, TFT_BLUE);
+    
+    Serial.print(F("JSON query NSurl = \'"));Serial.print(NSurl);Serial.print(F("\'\n"));
+    http.begin(NSurl); //HTTP
+    
+    Serial.print(F("[HTTP] GET...\n"));
+    // start connection and send HTTP header
+    int httpCode = http.GET();
   
-    // cfg.alarm_repeat = 1;
-    // cfg.snooze_timeout = 2;
-    // cfg.brightness1 = 0;
-    // cfg.temperature_unit = 3;
-    // cfg.date_format = 1;
-    // cfg.display_rotation = 7;
-    // cfg.invert_display = 1;
-    // cfg.info_line = 1;
+    // httpCode will be negative on error
+    if(httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
 
-    if(cfg.invert_display != -1) {
-      M5.Lcd.invertDisplay(cfg.invert_display);
-      Serial.print("Calling M5.Lcd.invertDisplay("); Serial.print(cfg.invert_display); Serial.println(")");
-    } else {
-      Serial.println("No invert_display defined in INI.");
-    }
-    M5.Lcd.setRotation(cfg.display_rotation);
-    lcdBrightness = cfg.brightness1;
-    M5.Lcd.setBrightness(lcdBrightness);
-    
-    startupLogo();
-    yield();
+      // file found at server
+      if(httpCode == HTTP_CODE_OK) {
+        String json = http.getString();
 
-    preferences.begin("M5StackNS", false);
-    if(preferences.getBool("SoftReset", false)) {
-      // no startup sound after soft reset and remove the SoftReset key
-      lastSnoozeTime=preferences.getUInt("LastSnoozeTime", 0);
-      preferences.remove("SoftReset");
-      preferences.remove("LastSnoozeTime");
-    } else {
-      // normal startup so decide by M5NS.INI if to play startup sound
-      if(cfg.snd_warning_at_startup) {
-        play_tone(3000, 100, cfg.warning_volume);
-        delay(500);
+        Serial.print(F("Free Heap = ")); Serial.println(ESP.getFreeHeap());
+        
+        auto JSONerr = deserializeJson(JSONdoc, json);
+        Serial.println(F("JSON deserialized OK"));
+        JsonArray arr=JSONdoc.as<JsonArray>();
+        Serial.print(F("JSON array size = ")); Serial.println(arr.size());
+        if (JSONerr || arr.size()==0) {   //Check for errors in parsing
+          if(JSONerr) {
+            err=1001; // "JSON parsing failed"
+          } else {
+            err=1002; // "No data from Nightscout"
+          }
+
+        } else {
+          JsonObject obj; 
+          int sgvindex = 0;
+          do {
+            obj=JSONdoc[sgvindex].as<JsonObject>();
+            sgvindex++;
+          } while ((!obj.containsKey(F("sgv"))) && (sgvindex<(arr.size()-1)));
+          sgvindex--;
+          if(sgvindex<0 || sgvindex>(arr.size()-1))
+            sgvindex=0;
+
+          ns.rawtime = JSONdoc[sgvindex][F("date")].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
+          strlcpy(ns.sensDir, JSONdoc[sgvindex][F("direction")] | "N/A", 32);
+          
+          ns.sensSgv = JSONdoc[sgvindex][F("sgv")]; // get value of sensor measurement
+          ns.sensTime = ns.rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
+          timeStampLatestBgReadingInSecondsUTC = ns.sensTime;   
+
+          ns.sensSgvMgDl = ns.sensSgv;
+          // internally we work in mmol/L
+          ns.sensSgv/=18.0;
+          
+          localtime_r(&ns.sensTime, &ns.sensTm);
+          
+          setNsArrowAngle();                                          
+
+          // screen should be updated
+          updateGlycemia();
+          
+          Serial.print(F("sensTime = "));
+          Serial.print(ns.sensTime);
+          sprintf(tmpstr, " (JSON %lld)", (long long) ns.rawtime);
+          Serial.print(tmpstr);
+          sprintf(tmpstr, " = %s", ctime(&ns.sensTime));
+          Serial.print(tmpstr);
+          Serial.print(F("sensSgv = "));
+          Serial.println(ns.sensSgv);
+          Serial.print(F("sensDir = "));
+          Serial.println(ns.sensDir);
+          // Serial.print(ns.sensTm.tm_year+1900); Serial.print(F(" / ")); Serial.print(ns.sensTm.tm_mon+1); Serial.print(F(" / ")); Serial.println(ns.sensTm.tm_mday);
+          Serial.print(F("Sensor time: ")); Serial.print(ns.sensTm.tm_hour); Serial.print(F(":")); Serial.print(ns.sensTm.tm_min); Serial.print(F(":")); Serial.print(ns.sensTm.tm_sec); Serial.print(F(" DST ")); Serial.println(ns.sensTm.tm_isdst);
+        } 
+      } else {
+        err=httpCode;
       }
-      if(cfg.snd_alarm_at_startup) {
-        play_tone(660, 400, cfg.alarm_volume);
-        delay(500);
+    } else {
+      Serial.print(F("httpCode = "));Serial.print(httpCode);Serial.print(F(", errorToString = "));Serial.println(http.errorToString(httpCode));
+      err=httpCode;
+    }
+    http.end();
+
+    if(err!=0)
+      return err;
+      
+  } else {
+    if (millis() - milliSecondsSinceLastCallToWifiConnectFromWithinNightScoutcheck > minimumTimeBetweenTwoCallsToWifiConnectFromWithinNightScoutcheck) {
+      connectToWiFiIfNightScoutUrlExists();
+      yield();
+      milliSecondsSinceLastCallToWifiConnectFromWithinNightScoutcheck = millis();
+    }
+    
+  }
+
+  M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
+
+  return err;
+}
+
+void updateGlycemia() {
+  char tmpstr[255];// MAKE GLOBAL AND AVOID RECREATION each TIME ???
+  
+  M5.Lcd.setTextDatum(TL_DATUM);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(0, 0);
+
+  switch(dispPage) {
+    case 1: {
+      
+      sprintf(tmpstr, "Glyk: %4.1f %s", ns.sensSgv, ns.sensDir);
+      Serial.println(tmpstr);
+      
+      char sensSgvStr[senssgvStringLength];
+      strcpy(sensSgvStr, "---");
+      M5.Lcd.setFreeFont(FSSB24);
+
+      struct tm timeinfo;
+      // if we can't get timeinfo then skip it all
+
+      unsigned long utcTimeInSeconds = getUTCTimeInSeconds();
+
+      if (utcTimeInSeconds >  0L) {
+
+        Serial.print(F("timeStampLatestBgReadingInSecondsUTC = ")); Serial.println(timeStampLatestBgReadingInSecondsUTC);
+        Serial.print(F("in updateGlycemia utcTimeInSeconds = ")); Serial.println(utcTimeInSeconds);
+
+        if (utcTimeInSeconds > timeStampLatestBgReadingInSecondsUTC + (5 * 60 + 10) || ns.sensSgvMgDl == 0) {
+          Serial.println(F("utcTimeInSeconds > timeStampLatestBgReadingInSecondsUTC + (5 * 60 + 10) or ns.sensSgvMgDl == 0, not showing value"));
+          // latest nightscout reading is more than 5 minutes old, don't show the value - value is "---"
+          M5.Lcd.setFreeFont(FSSB24);
+        } else {
+                if( cfg.show_mgdl == 0 ) {
+                  M5.Lcd.setFreeFont(FSSB24);
+                  if(ns.sensSgvMgDl<100) {
+                    sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
+                  } else {
+                    sprintf(sensSgvStr, "%3.0f", ns.sensSgvMgDl);
+                  }
+                } else {
+                  Serial.println("before checking ns.sensSgv");
+                  if(ns.sensSgv<10) {
+                    Serial.println("ns.sensSgv < 10");
+                  sprintf(sensSgvStr, "%3.1f", ns.sensSgv);
+                  M5.Lcd.setFreeFont(FSSB24);
+                } else {
+                  Serial.println("ns.sensSgv >= 10");
+                  sprintf(sensSgvStr, "%4.1f", ns.sensSgv);
+                  M5.Lcd.setFreeFont(FSSB18);
+                }
+              }
+
+        }
+      } else {
+        Serial.println(F("could not get local time info"));
       }
-    }
-    preferences.end();
 
-    delay(1000);
-    M5.Lcd.fillScreen(BLACK);
+      boolean previousEqualToNew = true;
+      // check if the string to show is new
+      if (strlen(sensSgvStr) != strlen(previousSensSgvStr)) {
+        previousEqualToNew = false;
+      } else {
+        if (strcmp(previousSensSgvStr, sensSgvStr) != 0) {
+          previousEqualToNew = false;
+        }
+      }
+      if (previousArrowAngle != ns.arrowAngle) {
+         previousEqualToNew = false;
+         previousArrowAngle = ns.arrowAngle;
+      }
+      
+      // if strings is new, then display the new string and copy to previousSensSgvStr
+      if (!previousEqualToNew) {
+         M5.Lcd.fillRect(0, 0, 320, 240, TFT_BLACK);// mini = screen size 80×160
+         if (isM5StickC) {
+           M5.Lcd.setTextSize(1);
+           M5.Lcd.setTextDatum(MC_DATUM);
+           M5.Lcd.drawString(sensSgvStr, 0, 19, 4);
+         } else {
+           M5.Lcd.setTextSize(4);
+           M5.Lcd.setTextDatum(MC_DATUM);
+           M5.Lcd.drawString(sensSgvStr, 160, 120, GFXFF);
+         }
 
-    M5.Lcd.setBrightness(lcdBrightness);
-    wifi_connect();
-    yield();
+         /// draw arrow
+         int ay=0;
+         if(ns.arrowAngle>=45)
+            ay=4;
+         else if(ns.arrowAngle>-45)
+            ay=18;
+          else
+            ay=30;
+      
+        if(ns.arrowAngle!=180) {
+           if (isM5StickC) {
+              drawArrow(112, 40, 10, ns.arrowAngle+85, 30, 30, textColor);
+           } else {
+              drawArrow(280, ay, 10, ns.arrowAngle+85, 28, 28, textColor);
+           }
+        }
 
-    M5.Lcd.setBrightness(lcdBrightness);
-    M5.Lcd.fillScreen(BLACK);
+        // copy sensSgvStr to previousSensSgvStr
+        for (int i = 0; i < senssgvStringLength; i++) {
+            previousSensSgvStr[i] = sensSgvStr[i];
+        }
+      }
     
-    // fill dummy values to error log
-    /*
-    for(int i=0; i<10; i++) {
-      getLocalTime(&err_log[i].err_time);
-      err_log[i].err_code=404;
+      //drawLogWarningIcon();
     }
-    getLocalTime(&err_log[6].err_time);
-    err_log[6].err_code=HTTPC_ERROR_CONNECTION_REFUSED;
-    err_log_ptr=10;
-    err_log_count=23;
-    */
-    
-    // test file with time stamps
-    // msCountLog = millis()-6000;
+    break;
+   
+    case MAX_PAGE: {
+      // display error log
+      char tmpStr[32];
+      HTTPClient http;
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setCursor(0, 18);
+      M5.Lcd.setTextDatum(TL_DATUM);
+      M5.Lcd.setFreeFont(FMB9);
+      M5.Lcd.setTextSize(1); 
+      M5.Lcd.drawString(F("Date  Time  Error Log"), 0, 0, GFXFF);
+      // M5.Lcd.drawString("Error", 143, 0, GFXFF);
+      M5.Lcd.setFreeFont(FM9);
+      if(err_log_ptr==0) {
+        M5.Lcd.drawString(F("no errors in log"), 0, 20, GFXFF);
+      } else {
+        for(int i=0; i<err_log_ptr; i++) {
+          sprintf(tmpStr, "%02d.%02d.%02d:%02d", err_log[i].err_time.tm_mday, err_log[i].err_time.tm_mon+1, err_log[i].err_time.tm_hour, err_log[i].err_time.tm_min);
+          M5.Lcd.drawString(tmpStr, 0, 20+i*18, GFXFF);
+          if(err_log[i].err_code<0) {
+            strlcpy(tmpStr, http.errorToString(err_log[i].err_code).c_str(), 32);
+          } else {
+            switch(err_log[i].err_code) {
+              case 1001:
+                strcpy(tmpStr, "JSON parsing failed");
+                break;
+              case 1002:
+                strcpy(tmpStr, "No data from Nightscout");
+                break;
+              case 1003:
+                strcpy(tmpStr, "JSON2 parsing failed");
+                break;
+              default:              
+                sprintf(tmpStr, "HTTP error %d", err_log[i].err_code);
+            }
+          }
+          M5.Lcd.drawString(tmpStr, 132, 20+i*18, GFXFF);
+        }
+        M5.Lcd.setFreeFont(FMB9);
+        sprintf(tmpStr, "Total errors %d", err_log_count);
+        M5.Lcd.drawString(tmpStr, 0, 20+err_log_ptr*18, GFXFF);
+      }
 
-    dispPage = cfg.default_page;
-    setPageIconPos(dispPage);
-    // stat startup time
-    msStart = millis();
-    // update glycemia now
-    msCount = msStart-16000;
+    }
+    break;
+  }
+}
+
+// the loop routine runs over and over again forever
+void loop(){
+
+  //Serial.println(F("in loop"));
+
+  delay(20);
+
+  unsigned long utcTimeInSeconds = getUTCTimeInSeconds();
+
+  // updateglycemia and call readNightScout every 120 seconds, or if latest reading is more than 2 minutes old, then check every 15 seconds, or if utcTimeInSeconds is still 0
+  // call to updateGlycemia here is only needed to make sure that if there's no recent reading, younger than 5 minutes, to make sure --- is shown
+  // if readNightScout results in a new reading, then this will also call updateGlyecemia
+  if((millis()-msCount>120000L) || ((millis()-msCount>5000) && utcTimeInSeconds == 0L)  || ((millis()-msCount>15000L) && utcTimeInSeconds > 0L && (utcTimeInSeconds-timeStampLatestBgReadingInSecondsUTC>120L))) {
+    updateGlycemia();
+    readNightscout();
+    msCount = millis();  
+  } else {
+    if((cfg.restart_at_logged_errors>0) && (err_log_count>=cfg.restart_at_logged_errors)) {
+      preferences.begin("M5StackNS", false);
+      preferences.putBool("SoftReset", true);
+      preferences.end();
+      ESP.restart();
+    }
+
+  }
+
+  M5.update();
+}
+
+//////// helper functions
+
+void configureTargetServerAndUrl(char *url, char *token) {
+
+    if(strncmp(url, "http", 4))
+      strcpy(NSurl,"https://");
+    else
+      strcpy(NSurl,"");
+    strcat(NSurl,url);
+    strcat(NSurl,"/api/v1/entries.json");
+    if ((token!=NULL) && (strlen(token)>0)){
+      strcat(NSurl,"?token=");
+      strcat(NSurl,token);
+    }
+  
+}
+
+void setNsArrowAngle() {
+          previousArrowAngle = ns.arrowAngle;
+            ns.arrowAngle = 180;
+          if(strcmp(ns.sensDir,"DoubleDown")==0)
+            ns.arrowAngle = 90;
+          else 
+            if(strcmp(ns.sensDir,"SingleDown")==0)
+              ns.arrowAngle = 75;
+            else 
+                if(strcmp(ns.sensDir,"FortyFiveDown")==0)
+                  ns.arrowAngle = 45;
+                else 
+                    if(strcmp(ns.sensDir,"Flat")==0)
+                      ns.arrowAngle = 0;
+                    else 
+                        if(strcmp(ns.sensDir,"FortyFiveUp")==0)
+                          ns.arrowAngle = -45;
+                        else 
+                            if(strcmp(ns.sensDir,"SingleUp")==0)
+                              ns.arrowAngle = -75;
+                            else 
+                                if(strcmp(ns.sensDir,"DoubleUp")==0)
+                                  ns.arrowAngle = -90;
+                                else 
+                                    if(strcmp(ns.sensDir,"NONE")==0)
+                                      ns.arrowAngle = 180;
+                                    else 
+                                        if(strcmp(ns.sensDir,"NOT COMPUTABLE")==0)
+                                          ns.arrowAngle = 180;
+
 }
 
 void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color){
@@ -656,1275 +778,441 @@ void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uin
   M5.Lcd.drawLine(x, y-2, xx1, yy1-2, color);
 }
 
-void drawMiniGraph(struct NSinfo *ns){
-  /*
-  // draw help lines
-  for(int i=0; i<320; i+=40) {
-    M5.Lcd.drawLine(i, 0, i, 240, TFT_DARKGREY);
-  }
-  for(int i=0; i<240; i+=30) {
-    M5.Lcd.drawLine(0, i, 320, i, TFT_DARKGREY);
-  }
-  M5.Lcd.drawLine(0, 120, 320, 120, TFT_LIGHTGREY);
-  M5.Lcd.drawLine(160, 0, 160, 240, TFT_LIGHTGREY);
-  */
-  int i;
-  float glk;
-  uint16_t sgvColor;
-  // M5.Lcd.drawLine(231, 110, 319, 110, TFT_DARKGREY);
-  // M5.Lcd.drawLine(231, 110, 231, 207, TFT_DARKGREY);
-  // M5.Lcd.drawLine(231, 207, 319, 207, TFT_DARKGREY);
-  // M5.Lcd.drawLine(319, 110, 319, 207, TFT_DARKGREY);
-  M5.Lcd.drawLine(231, 113, 319, 113, TFT_LIGHTGREY);
-  M5.Lcd.drawLine(231, 203, 319, 203, TFT_LIGHTGREY);
-  M5.Lcd.drawLine(231, 200-(4-3)*10+3, 319, 200-(4-3)*10+3, TFT_LIGHTGREY);
-  M5.Lcd.drawLine(231, 200-(9-3)*10+3, 319, 200-(9-3)*10+3, TFT_LIGHTGREY);
-  Serial.print("Last 10 values: ");
-  for(i=9; i>=0; i--) {
-    sgvColor = TFT_GREEN;
-    glk = *(ns->last10sgv+9-i);
-    if(glk>12) {
-      glk = 12;
-    } else {
-      if(glk<3) {
-        glk = 3;
-      }
-    }
-    if(glk<cfg.red_low || glk>cfg.red_high) {
-      sgvColor = TFT_RED;
-    } else {
-      if(glk<cfg.yellow_low || glk>cfg.yellow_high) {
-        sgvColor = TFT_YELLOW;
-      }
-    }
-    Serial.print(*(ns->last10sgv+i)); Serial.print(" ");
-    if(*(ns->last10sgv+9-i)!=0)
-      M5.Lcd.fillCircle(234+i*9, 203-(glk-3.0)*10.0, 3, sgvColor);
-  }
-  Serial.println();
-}
-
-int readNightscout(char *url, char *token, struct NSinfo *ns) {
-  HTTPClient http;
-  char NSurl[128];
-  int err=0;
-  char tmpstr[32];
-  
-  if((WiFiMulti.run() == WL_CONNECTED)) {
-    // configure target server and url
-    if(strncmp(url, "http", 4))
-      strcpy(NSurl,"https://");
-    else
-      strcpy(NSurl,"");
-    strcat(NSurl,url);
-    if(strstr(NSurl,"sugarmate") != NULL) // Sugarmate JSON URL for Dexcom follower
-      ns->is_Sugarmate = 1;
-    else
-    {
-      ns->is_Sugarmate = 0;
-      if(cfg.sgv_only) {
-        strcat(NSurl,"/api/v1/entries.json?find[type][$eq]=sgv");
-      } else {
-        strcat(NSurl,"/api/v1/entries.json");
-      }
-      if ((token!=NULL) && (strlen(token)>0)) {
-        if(strchr(NSurl,'?'))
-          strcat(NSurl,"&token=");
-        else
-          strcat(NSurl,"?token=");
-        strcat(NSurl,token);
-      }
-    }
-  
-    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
-    drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi2_icon16x16, TFT_BLUE);
-    
-    Serial.print("JSON query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
-    http.begin(NSurl); //HTTP
-    
-    Serial.print("[HTTP] GET...\n");
-    // start connection and send HTTP header
-    int httpCode = http.GET();
-  
-    // httpCode will be negative on error
-    if(httpCode > 0) {
-      // HTTP header has been send and Server response header has been handled
-      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
-
-      // file found at server
-      if(httpCode == HTTP_CODE_OK) {
-        String json = http.getString();
-        // remove any non text characters (just for sure)
-        for(int i=0; i<json.length(); i++) {
-          // Serial.print(json.charAt(i), DEC); Serial.print(" = "); Serial.println(json.charAt(i));
-          if(json.charAt(i)<32 /* || json.charAt(i)=='\\' */) {
-            json.setCharAt(i, 32);
-          }
-        }
-        // json.replace("\\n"," ");
-        // invalid Unicode character defined by Ascensia Diabetes Care Bluetooth Glucose Meter
-        // ArduinoJSON does not accept any unicode surrogate pairs like \u0032 or \u0000
-        json.replace("\\u0000"," ");
-        json.replace("\\u0032"," ");
-        // Serial.println(json);
-        // const size_t capacity = JSON_ARRAY_SIZE(10) + 10*JSON_OBJECT_SIZE(19) + 3840;
-        // Serial.print("JSON size needed= "); Serial.print(capacity); 
-        Serial.print("Free Heap = "); Serial.println(ESP.getFreeHeap());
-        DeserializationError JSONerr = deserializeJson(JSONdoc, json);
-        Serial.println("JSON deserialized OK");
-        JsonArray arr=JSONdoc.as<JsonArray>();
-        Serial.print("JSON array size = "); Serial.println(arr.size());
-        if (JSONerr || (ns->is_Sugarmate==0 && arr.size()==0)) {   //Check for errors in parsing
-          if(JSONerr) {
-            err=1001; // "JSON parsing failed"
-          } else {
-            err=1002; // "No data from Nightscout"
-          }
-          addErrorLog(err);
-        } else {
-          JsonObject obj;
-          if(ns->is_Sugarmate==0) {
-            // Nightscout values
-
-            int sgvindex = 0;
-            do {
-              obj=JSONdoc[sgvindex].as<JsonObject>();
-              sgvindex++;
-            } while ((!obj.containsKey("sgv")) && (sgvindex<(arr.size()-1)));
-            sgvindex--;
-            if(sgvindex<0 || sgvindex>(arr.size()-1))
-              sgvindex=0;
-            strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
-            ns->is_xDrip = obj.containsKey("xDrip_raw");
-            ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
-            ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
-            strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
-            ns->sensSgv = JSONdoc[sgvindex]["sgv"]; // get value of sensor measurement
-            for(int i=0; i<=9; i++) {
-              ns->last10sgv[i]=JSONdoc[i]["sgv"];
-              ns->last10sgv[i]/=18.0;
-            }
-          } else {
-            // Sugarmate values
-            strcpy(ns->sensDev, "Sugarmate");
-            ns->is_xDrip = 0;
-            ns->sensSgv = JSONdoc["value"]; // get value of sensor measurement
-            time_t tmptime = JSONdoc["x"]; // time in milliseconds since 1970
-            if(ns->sensTime != tmptime) {
-              for(int i=9; i>=0; i--) { // add new value and shift buffer
-               ns->last10sgv[i]=ns->last10sgv[i-1];
-              }
-              ns->last10sgv[0] = ns->sensSgv;
-              ns->sensTime = tmptime;
-            }
-            ns->rawtime = (long long)ns->sensTime * (long long)1000; // possibly not needed, but to make the structure values complete
-            strlcpy(ns->sensDir, JSONdoc["trend_words"] | "N/A", 32);
-            ns->delta_mgdl = JSONdoc["delta"]; // get value of sensor measurement
-            ns->delta_absolute = ns->delta_mgdl;
-            ns->delta_interpolated = 0;
-            ns->delta_scaled = ns->delta_mgdl/18.0;
-            if(cfg.show_mgdl) {
-              sprintf(ns->delta_display, "%+d", ns->delta_mgdl);
-            } else {
-              sprintf(ns->delta_display, "%+.1f", ns->delta_scaled);
-            }
-          }
-          ns->sensSgvMgDl = ns->sensSgv;
-          // internally we work in mmol/L
-          ns->sensSgv/=18.0;
-          
-          localtime_r(&ns->sensTime, &ns->sensTm);
-          
-          ns->arrowAngle = 180;
-          if(strcmp(ns->sensDir,"DoubleDown")==0 || strcmp(ns->sensDir,"DOUBLE_DOWN")==0)
-            ns->arrowAngle = 90;
-          else 
-            if(strcmp(ns->sensDir,"SingleDown")==0 || strcmp(ns->sensDir,"SINGLE_DOWN")==0)
-              ns->arrowAngle = 75;
-            else 
-                if(strcmp(ns->sensDir,"FortyFiveDown")==0 || strcmp(ns->sensDir,"FORTY_FIVE_DOWN")==0)
-                  ns->arrowAngle = 45;
-                else 
-                    if(strcmp(ns->sensDir,"Flat")==0 || strcmp(ns->sensDir,"FLAT")==0)
-                      ns->arrowAngle = 0;
-                    else 
-                        if(strcmp(ns->sensDir,"FortyFiveUp")==0 || strcmp(ns->sensDir,"FORTY_FIVE_UP")==0)
-                          ns->arrowAngle = -45;
-                        else 
-                            if(strcmp(ns->sensDir,"SingleUp")==0 || strcmp(ns->sensDir,"SINGLE_UP")==0)
-                              ns->arrowAngle = -75;
-                            else 
-                                if(strcmp(ns->sensDir,"DoubleUp")==0 || strcmp(ns->sensDir,"DOUBLE_UP")==0)
-                                  ns->arrowAngle = -90;
-                                else 
-                                    if(strcmp(ns->sensDir,"NONE")==0)
-                                      ns->arrowAngle = 180;
-                                    else 
-                                        if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
-                                          ns->arrowAngle = 180;
-                                          
-          Serial.print("sensDev = ");
-          Serial.println(ns->sensDev);
-          Serial.print("sensTime = ");
-          Serial.print(ns->sensTime);
-          sprintf(tmpstr, " (JSON %lld)", (long long) ns->rawtime);
-          Serial.print(tmpstr);
-          sprintf(tmpstr, " = %s", ctime(&ns->sensTime));
-          Serial.print(tmpstr);
-          Serial.print("sensSgv = ");
-          Serial.println(ns->sensSgv);
-          Serial.print("sensDir = ");
-          Serial.println(ns->sensDir);
-          // Serial.print(ns->sensTm.tm_year+1900); Serial.print(" / "); Serial.print(ns->sensTm.tm_mon+1); Serial.print(" / "); Serial.println(ns->sensTm.tm_mday);
-          Serial.print("Sensor time: "); Serial.print(ns->sensTm.tm_hour); Serial.print(":"); Serial.print(ns->sensTm.tm_min); Serial.print(":"); Serial.print(ns->sensTm.tm_sec); Serial.print(" DST "); Serial.println(ns->sensTm.tm_isdst);
-        } 
-      } else {
-        addErrorLog(httpCode);
-        err=httpCode;
-      }
-    } else {
-      addErrorLog(httpCode);
-      err=httpCode;
-    }
-    http.end();
-
-    if(err!=0) {
-      Serial.printf("Returnining with error %d\n",err);
-      return err;
-    }
-      
-
-    if(ns->is_Sugarmate)
-      return 0; // no second query if using Sugarmate
-      
-    // the second query 
-    if(strncmp(url, "http", 4))
-      strcpy(NSurl,"https://");
-    else
-      strcpy(NSurl,"");
-    strcat(NSurl,url);
-    strcat(NSurl,"/api/v2/properties/iob,cob,delta,loop,basal");
-    if (strlen(token) > 0){
-      strcat(NSurl,"&token=");
-      strcat(NSurl,token);
-    }
-    
-    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
-    drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi1_icon16x16, TFT_BLUE);
-
-    Serial.print("Properties query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
-    http.begin(NSurl); //HTTP
-    Serial.print("[HTTP] GET properties...\n");
-    httpCode = http.GET();
-    if(httpCode > 0) {
-      Serial.printf("[HTTP] GET properties... code: %d\n", httpCode);
-      if(httpCode == HTTP_CODE_OK) {
-        // const char* propjson = "{\"iob\":{\"iob\":0,\"activity\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"display\":\"0\",\"displayLine\":\"IOB: 0U\"},\"cob\":{\"cob\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"treatmentCOB\":{\"decayedBy\":\"2019-05-11T23:05:00.000Z\",\"isDecaying\":0,\"carbs_hr\":20,\"rawCarbImpact\":0,\"cob\":7,\"lastCarbs\":{\"_id\":\"5cd74c26156712edb4b32455\",\"enteredBy\":\"Martin\",\"eventType\":\"Carb Correction\",\"reason\":\"\",\"carbs\":7,\"duration\":0,\"created_at\":\"2019-05-11T22:24:00.000Z\",\"mills\":1557613440000,\"mgdl\":67}},\"display\":0,\"displayLine\":\"COB: 0g\"},\"delta\":{\"absolute\":-4,\"elapsedMins\":4.999483333333333,\"interpolated\":false,\"mean5MinsAgo\":69,\"mgdl\":-4,\"scaled\":-0.2,\"display\":\"-0.2\",\"previous\":{\"mean\":69,\"last\":69,\"mills\":1557613221946,\"sgvs\":[{\"mgdl\":69,\"mills\":1557613221946,\"device\":\"MIAOMIAO\",\"direction\":\"Flat\",\"filtered\":92588,\"unfiltered\":92588,\"noise\":1,\"rssi\":100}]}}}";
-        String propjson = http.getString();
-        // remove any non text characters (just for sure)
-        for(int i=0; i<propjson.length(); i++) {
-          // Serial.print(propjson.charAt(i), DEC); Serial.print(" = "); Serial.println(propjson.charAt(i));
-          if(propjson.charAt(i)<32 /* || propjson.charAt(i)=='\\' */) {
-            propjson.setCharAt(i, 32);
-          }
-        }
-        // propjson.replace("\\n"," ");
-        // invalid Unicode character defined by Ascensia Diabetes Care Bluetooth Glucose Meter
-        // ArduinoJSON does not accept any unicode surrogate pairs like \u0032 or \u0000
-        propjson.replace("\\u0000"," ");
-        propjson.replace("\\u0032"," ");
-        DeserializationError propJSONerr = deserializeJson(JSONdoc, propjson);
-        if(propJSONerr) {
-          err=1003; // "JSON2 parsing failed"
-          addErrorLog(err);
-        } else {
-          Serial.println("Deserialized the second JSON and OK");
-          JsonObject iob = JSONdoc["iob"];
-          ns->iob = iob["iob"]; // 0
-          strncpy(ns->iob_display, iob["display"] | "N/A", 16); // 0
-          strncpy(ns->iob_displayLine, iob["displayLine"] | "IOB: N/A", 16); // "IOB: 0U"
-          // Serial.println("IOB OK");
-          
-          JsonObject cob = JSONdoc["cob"];
-          ns->cob = cob["cob"]; // 0
-          strncpy(ns->cob_display, cob["display"] | "N/A", 16); // 0
-          strncpy(ns->cob_displayLine, cob["displayLine"] | "COB: N/A", 16); // "COB: 0g"
-          // Serial.println("COB OK");
-          
-          JsonObject delta = JSONdoc["delta"];
-          ns->delta_absolute = delta["absolute"]; // -4
-          ns->delta_elapsedMins = delta["elapsedMins"]; // 4.999483333333333
-          ns->delta_interpolated = delta["interpolated"]; // false
-          ns->delta_mean5MinsAgo = delta["mean5MinsAgo"]; // 69
-          ns->delta_mgdl = delta["mgdl"]; // -4
-          ns->delta_scaled = delta["scaled"]; // -0.2
-          strncpy(ns->delta_display, delta["display"] | "", 16); // "-0.2"
-          // Serial.println("DELTA OK");
-          
-          JsonObject loop_obj = JSONdoc["loop"];
-          JsonObject loop_display = loop_obj["display"];
-          strncpy(tmpstr, loop_display["symbol"] | "?", 4); // "⌁"
-          ns->loop_display_symbol = tmpstr[0];
-          strncpy(ns->loop_display_code, loop_display["code"] | "N/A", 16); // "enacted"
-          strncpy(ns->loop_display_label, loop_display["label"] | "N/A", 16); // "Enacted"
-          // Serial.println("LOOP OK");
-
-          JsonObject basal = JSONdoc["basal"];
-          strncpy(ns->basal_display, basal["display"] | "N/A", 16); // "T: 0.950U"      
-          // Serial.println("BASAL OK");
-          
-          JsonObject basal_current_doc = JSONdoc["basal"]["current"];
-          ns->basal_current = basal_current_doc["basal"]; // 0.1
-          ns->basal_tempbasal = basal_current_doc["tempbasal"]; // 0.1
-          ns->basal_combobolusbasal = basal_current_doc["combobolusbasal"]; // 0
-          ns->basal_totalbasal = basal_current_doc["totalbasal"]; // 0.1
-          // Serial.println("LOOP OK");
-        } 
-      } else {
-        addErrorLog(httpCode);
-        err=httpCode;
-      }
-    } else {
-      addErrorLog(httpCode);
-      err=httpCode;
-    }
-    http.end();
-  } else {
-    // WiFi not connected
-    ESP.restart();
-  }
-
-  M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
-
-  return err;
-}
-
-void drawBatteryStatus(int16_t x, int16_t y) {
-  int8_t battLevel = getBatteryLevel();
-  Serial.print("Battery level: "); Serial.println(battLevel);
-  M5.Lcd.fillRect(x, y, 16, 17, TFT_BLACK);
-  if(battLevel!=-1) {
-    switch(battLevel) {
-      case 0:
-        drawIcon(x, y+1, (uint8_t*)bat0_icon16x16, TFT_RED);
-        break;
-      case 25:
-        drawIcon(x, y+1, (uint8_t*)bat1_icon16x16, TFT_YELLOW);
-        break;
-      case 50:
-        drawIcon(x, y+1, (uint8_t*)bat2_icon16x16, TFT_WHITE);
-        break;
-      case 75:
-        drawIcon(x, y+1, (uint8_t*)bat3_icon16x16, TFT_LIGHTGREY);
-        break;
-      case 100:
-        drawIcon(x, y+0, (uint8_t*)plug_icon16x16, TFT_LIGHTGREY);
-        break;
-    }
-  }
-}
-
-void handleAlarmsInfoLine(struct NSinfo *ns) {
-  struct tm timeinfo;
-
-  // calculate sensor time difference
-  // calculate last alarm time difference
-  int sensorDifSec=24*60*60; // too much
-  int alarmDifSec=24*60*60; // too much
-  int snoozeDifSec=cfg.snooze_timeout*60; // timeout
-  if(getLocalTime(&timeinfo)){
-    sensorDifSec=difftime(mktime(&timeinfo), ns->sensTime);
-    alarmDifSec=difftime(mktime(&timeinfo), lastAlarmTime);
-    snoozeDifSec=difftime(mktime(&timeinfo), lastSnoozeTime);
-    if( snoozeDifSec>cfg.snooze_timeout*60 )
-      snoozeDifSec=cfg.snooze_timeout*60; // timeout
-  }
-  unsigned int sensorDifMin = (sensorDifSec+30)/60;
-  
-  Serial.print("Alarm time difference = "); Serial.print(alarmDifSec); Serial.println(" sec");
-  Serial.print("Snooze time difference = "); Serial.print(snoozeDifSec); Serial.println(" sec");
-  char tmpStr[10];
-  M5.Lcd.setTextDatum(TL_DATUM);
-  if( snoozeDifSec<cfg.snooze_timeout*60 ) {
-    sprintf(tmpStr, "%i", (cfg.snooze_timeout*60-snoozeDifSec+59)/60);
-    if(dispPage<MAX_PAGE)
-      drawIcon(icon_xpos[1], icon_ypos[1], (uint8_t*)clock_icon16x16, TFT_RED);
-  } else {
-    strcpy(tmpStr, "Snooze");
-    if(dispPage<MAX_PAGE)
-      M5.Lcd.fillRect(icon_xpos[1], icon_ypos[1], 16, 16, BLACK);
-  }
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setFreeFont(FSSB12);
-  // Serial.print("sensSgv="); Serial.print(sensSgv); Serial.print(", cfg.snd_alarm="); Serial.println(cfg.snd_alarm); 
-  if((ns->sensSgv<=cfg.snd_alarm) && (ns->sensSgv>=0.1)) {
-    // red alarm state
-    // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
-    Serial.println("ALARM LOW");
-    M5.Lcd.fillRect(0, 220, 320, 20, TFT_RED);
-    M5.Lcd.setTextColor(TFT_BLACK, TFT_RED);
-    int stw=M5.Lcd.textWidth(tmpStr);
-    M5.Lcd.drawString(tmpStr, 159-stw/2, 220, GFXFF);
-    if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-        sndAlarm();
-        lastAlarmTime = mktime(&timeinfo);
-    }
-  } else {
-    if((ns->sensSgv<=cfg.snd_warning) && (ns->sensSgv>=0.1)) {
-      // yellow warning state
-      // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
-      Serial.println("WARNING LOW");
-      M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
-      M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
-      int stw=M5.Lcd.textWidth(tmpStr);
-      M5.Lcd.drawString(tmpStr, 159-stw/2, 220, GFXFF);
-      if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-        sndWarning();
-        lastAlarmTime = mktime(&timeinfo);
-      }
-    } else {
-      if( ns->sensSgv>=cfg.snd_alarm_high ) {
-        // red alarm state
-        // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
-        Serial.println("ALARM HIGH");
-        M5.Lcd.fillRect(0, 220, 320, 20, TFT_RED);
-        M5.Lcd.setTextColor(TFT_BLACK, TFT_RED);
-        int stw=M5.Lcd.textWidth(tmpStr);
-        M5.Lcd.drawString(tmpStr, 159-stw/2, 220, GFXFF);
-        if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-            sndAlarm();
-            lastAlarmTime = mktime(&timeinfo);
-        }
-      } else {
-        if( ns->sensSgv>=cfg.snd_warning_high ) {
-          // yellow warning state
-          // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
-          Serial.println("WARNING HIGH");
-          M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
-          M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
-          int stw=M5.Lcd.textWidth(tmpStr);
-          M5.Lcd.drawString(tmpStr, 159-stw/2, 220, GFXFF);
-          if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-            sndWarning();
-            lastAlarmTime = mktime(&timeinfo);
-          }
-        } else {
-          if( sensorDifMin>=cfg.snd_no_readings ) {
-            // yellow warning state
-            // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
-            Serial.println("WARNING NO READINGS");
-            M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
-            M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
-            int stw=M5.Lcd.textWidth(tmpStr);
-            M5.Lcd.drawString(tmpStr, 159-stw/2, 220, GFXFF);
-            if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-              sndWarning();
-              lastAlarmTime = mktime(&timeinfo);
-            }
-          } else {
-            // normal glycemia state
-            M5.Lcd.fillRect(0, 220, 320, 20, TFT_BLACK);
-            M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-            // draw info line
-            char infoStr[64];
-            switch( cfg.info_line ) {
-              case 0: // sensor information
-                strcpy(infoStr, ns->sensDev);
-                if(strcmp(infoStr,"MIAOMIAO")==0) {
-                  if(ns->is_xDrip) {
-                    strcpy(infoStr,"xDrip MiaoMiao + Libre");
-                  } else {
-                    strcpy(infoStr,"Spike MiaoMiao + Libre");
-                  }
-                }
-                if(strcmp(infoStr,"Tomato")==0)
-                  strcat(infoStr," MiaoMiao + Libre");
-                M5.Lcd.drawString(infoStr, 0, 220, GFXFF);
-                break;
-              case 1: // button function icons
-                drawIcon(58, 220, (uint8_t*)sun_icon16x16, TFT_LIGHTGREY);
-                drawIcon(153, 220, (uint8_t*)clock_icon16x16, TFT_LIGHTGREY);
-                // drawIcon(153, 220, (uint8_t*)timer_icon16x16, TFT_LIGHTGREY);
-                drawIcon(246, 220, (uint8_t*)door_icon16x16, TFT_LIGHTGREY);
-                break;
-              case 2: // loop + basal information
-                strcpy(infoStr, "L: ");
-                strlcat(infoStr, ns->loop_display_label, 64);
-                M5.Lcd.drawString(infoStr, 0, 220, GFXFF);
-                strcpy(infoStr, "B: ");
-                strlcat(infoStr, ns->basal_display, 64);
-                M5.Lcd.drawString(infoStr, 160, 220, GFXFF);
-                break;
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-void drawLogWarningIcon() {
-  if(err_log_ptr>5)
-    drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)warning_icon16x16, TFT_YELLOW);
-  else
-    if(err_log_ptr>0)
-      drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)warning_icon16x16, TFT_LIGHTGREY);
-    else
-      M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
-}
-
-void drawSegment(int x, int y, int r1, int r2, float a, int col)
+void byteArrayToHexString(byte array[], unsigned int len, char buffer[])
 {
-  a = (a / 57.2958) - 1.57; 
-  float a1 = a-1.57,
-      a2 = a+1.57,
-      x1 = x + (cos(a1) * r1),
-      y1 = y + (sin(a1) * r1),
-      x2 = x + (cos(a2) * r1),
-      y2 = y + (sin(a2) * r1),
-      x3 = x + (cos(a) * r2),
-      y3 = y + (sin(a) * r2);
-      
-  M5.Lcd.fillTriangle(x1,y1,x2,y2,x3,y3,col);
+    for (unsigned int i = 0; i < len; i++)
+    {
+        byte nib1 = (array[i] >> 4) & 0x0F;
+        byte nib2 = (array[i] >> 0) & 0x0F;
+        buffer[i*2+0] = nib1  < 0xA ? '0' + nib1  : 'A' + nib1  - 0xA;
+        buffer[i*2+1] = nib2  < 0xA ? '0' + nib2  : 'A' + nib2  - 0xA;
+    }
+    buffer[len*2] = '\0';
 }
 
-void draw_page() {
-  char tmpstr[255];
+// returns index of first occurrence of value '0', which can be considered as end of string 
+// maxsize must be set to size of the array, for some reason getting the size of stringtext by call .lenght() or sizeof doesn't work. To avoid run-time errors, the maxsize must be passed as parameter
+int sizeOfStringInCharArray(char stringtext[], int arraysize) {
+ int returnValue = 0;
+  while (uint8_t(stringtext[returnValue]) != 0 && returnValue < arraysize) {
+    returnValue = returnValue + 1;
+  }
+  return returnValue;
+}
+
+// sends opCode and textToSend to characteristic. Possibly split in multiple packets
+// first byte = opcode, second byte = packet number, third byte = number of packets in total
+void sendTextToBLEClient(char * textToSend, uint8_t opCode, int maximumSizeOfTextToSend) {
+
+             int sizeOfTextToSend = sizeOfStringInCharArray(textToSend, maximumSizeOfTextToSend);
+
+             // if sizeOfTextToSend = 0, then it means there's just an opcode being sent
+             if (sizeOfTextToSend == 0) {
+                uint8_t dataToSend[3];
+                dataToSend[0] = opCode;
+                dataToSend[1] = 0x01;
+                dataToSend[2] = 0x01;
+                pRxTxCharacteristic->setValue(dataToSend, 3);
+                pRxTxCharacteristic->notify();
+                return;
+             }
+
+             // 20 (maxBytesInOneBLEPacket) bytes per packet. First byte = opcode, second byte is packet number, third byte = total number of packets
+             
+             // text may be longer than maximum ble packet size, need to split up, this variable tells us how many characters are already sent
+             int charactersSent = 0;
+
+             // number of packets is total size / (maxBytesInOneBLEPacket - 3) , possibly + 1
+             int totalNumberOfPacketsToSent = sizeOfTextToSend/(maxBytesInOneBLEPacket - 3);
+             if (sizeOfTextToSend > totalNumberOfPacketsToSent * (maxBytesInOneBLEPacket - 3)) {
+                totalNumberOfPacketsToSent++;
+             }
+
+             // number of the next packet to send
+             int numberOfNextPacketToSend = 1;
+
+             // send them one by one
+             while (charactersSent < sizeOfTextToSend) {
+
+                // calculate size of packet to send
+                int sizeOfNextPacketToSend = maxBytesInOneBLEPacket;
+                if (numberOfNextPacketToSend == totalNumberOfPacketsToSent) {
+                  sizeOfNextPacketToSend = 3 + (sizeOfTextToSend - charactersSent);//First byte = opcode, second byte is packet number, third byte = total number of packets, rest is content
+                }
+
+                // craete and populate dataToSend
+                uint8_t dataToSend[sizeOfNextPacketToSend];
+                dataToSend[0] = opCode;
+                dataToSend[1] = numberOfNextPacketToSend;
+                dataToSend[2] = totalNumberOfPacketsToSent;
+                for (int i = 0; i < sizeOfNextPacketToSend - 3; i++) {
+                   dataToSend[i + 3] = uint8_t(textToSend[charactersSent + i]);
+                }
+
+                // send the data 
+                if (debugLogging) {
+                  Serial.print(F("sending packet "));Serial.print(numberOfNextPacketToSend);Serial.print(F(" for text "));Serial.print(textToSend);Serial.print(F(" with opcode "));Serial.print(opCode);Serial.println(F(" to client"));
+                }
+                pRxTxCharacteristic->setValue(dataToSend, sizeOfNextPacketToSend);
+                pRxTxCharacteristic->notify();
+
+                // increase charactersSent
+                charactersSent = charactersSent + (sizeOfNextPacketToSend - 3);
+
+                // increase numberOfNextPacketToSend
+                numberOfNextPacketToSend++;
+                
+             }
+
+}
+
+///////// BLE declarations
+
+class BLECharacteristicCallBack: public BLECharacteristicCallbacks {
   
-  M5.Lcd.setTextDatum(TL_DATUM);
-  M5.Lcd.setTextColor(WHITE, BLACK);
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setCursor(0, 0);
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    
+    std::string rxValue = pCharacteristic->getValue();
 
-  switch(dispPage) {
-    case 0: {
-      // if there was an error, then clear whole screen, otherwise only graphic updated part
-      // M5.Lcd.fillScreen(BLACK);
-      // M5.Lcd.fillRect(230, 110, 90, 100, TFT_BLACK);
-      
-      // readNightscout(cfg.url, cfg.token, &ns);
-
-      M5.Lcd.setFreeFont(FSSB12);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      // char dateStr[30];
-      // sprintf(dateStr, "%d.%d.%04d", sensTm.tm_mday, sensTm.tm_mon+1, sensTm.tm_year+1900);
-      // M5.Lcd.drawString(dateStr, 0, 48, GFXFF);
-      // char timeStr[30];
-      // sprintf(timeStr, "%02d:%02d:%02d", sensTm.tm_hour, sensTm.tm_min, sensTm.tm_sec);
-      // M5.Lcd.drawString(timeStr, 0, 72, GFXFF);
-      char datetimeStr[30];
-      struct tm timeinfo;
-      if(cfg.show_current_time) {
-        if(getLocalTime(&timeinfo)) {
-          // sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday, timeinfo.tm_mon+1);  
-          // timeinfo.tm_mday=24; timeinfo.tm_mon=11;
-          switch(cfg.date_format) {
-            case 1:
-              sprintf(datetimeStr, "%02d:%02d  %d/%d  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mon+1, timeinfo.tm_mday);
-              break;
-            default:
-              sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mday, timeinfo.tm_mon+1);  
-          }
-        } else {
-          // strcpy(datetimeStr, "??:??:??");
-          strcpy(datetimeStr, "??:??");
-        }
-      } else {
-        // sprintf(datetimeStr, "%02d:%02d:%02d  %d.%d.  ", sensTm.tm_hour, sensTm.tm_min, sensTm.tm_sec, sensTm.tm_mday, sensTm.tm_mon+1);
-        sprintf(datetimeStr, "%02d:%02d  %d.%d.  ", ns.sensTm.tm_hour, ns.sensTm.tm_min, ns.sensTm.tm_mday, ns.sensTm.tm_mon+1);
-      }
-      M5.Lcd.drawString(datetimeStr, 0, 0, GFXFF);
-
-      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
-      
-      if(err_log_ptr>0) {
-        M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
-        if(err_log_ptr>5)
-          drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)warning_icon16x16, TFT_YELLOW);
-        else
-          drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)warning_icon16x16, TFT_LIGHTGREY);
-      }
-              
-      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Lcd.drawString(cfg.userName, 0, 24, GFXFF);
-      
-      if(cfg.show_COB_IOB) {
-        M5.Lcd.setFreeFont(FSSB12);
-        M5.Lcd.setTextSize(1);
-        // show small delta right from name
-        /*
-        M5.Lcd.setFreeFont(FSSB12);
-        M5.Lcd.setTextColor(WHITE, BLACK);
-        M5.Lcd.setTextSize(1);
-        M5.Lcd.fillRect(130,24,69,23,TFT_BLACK);
-        M5.Lcd.drawString(ns.delta_display, 130, 24, GFXFF);
-        */
+    if (rxValue.length() > 0) {
         
-        M5.Lcd.fillRect(0,48,199,47,TFT_BLACK);
-        if(ns.iob>0)
-          M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-        else
-          M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        Serial.print("ns.iob_displayLine=\""); Serial.print(ns.iob_displayLine); Serial.println("\"");
-        strncpy(tmpstr, ns.iob_displayLine, 16);
-        if(strncmp(tmpstr, "IOB:", 4)==0) {
-          strcpy(tmpstr,"I");
-          strcat(tmpstr, &ns.iob_displayLine[3]);
+        for (int i = 0; i < maxBytesInOneBLEPacket;i++) {
+          rxValueAsByteArray[i] = 0x00;
         }
-        M5.Lcd.drawString(tmpstr, 0, 48, GFXFF);
-        if(ns.cob>0)
-          M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-        else
-          M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        Serial.print("ns.cob_displayLine=\""); Serial.print(ns.cob_displayLine); Serial.println("\"");
-        strncpy(tmpstr, ns.cob_displayLine, 16);
-        if(strncmp(tmpstr, "COB:", 4)==0) {
-          strcpy(tmpstr,"C");
-          strcat(tmpstr, &ns.cob_displayLine[3]);
+        memcpy(rxValueAsByteArray, rxValue.c_str(), rxValue.length());
+
+        // only for logging
+        if (debugLogging) {
+          char rxValueAsHexString[rxValue.length() * 2] = "";
+          byteArrayToHexString(rxValueAsByteArray, rxValue.length(), rxValueAsHexString);
+          Serial.print(F("Received Value from BLE client : "));Serial.println(rxValueAsHexString);
         }
-        M5.Lcd.drawString(tmpstr, 0, 72, GFXFF);
 
-        // show BIG delta bellow the name
-        M5.Lcd.setFreeFont(FSSB24);
-        // strcpy(ns.delta_display, "+8.9");
-        if(ns.delta_mgdl>7)
-          M5.Lcd.setTextColor(TFT_WHITE, BLACK);
-        else
-          M5.Lcd.setTextColor(TFT_LIGHTGREY, BLACK);
-        M5.Lcd.drawString(ns.delta_display, 103, 48, GFXFF);
-        M5.Lcd.setFreeFont(FSSB12);
+        // see what server has been sending
+        byte opCode = rxValueAsByteArray[0];
+        switch (opCode) {
 
-      } else {
-        // show BIG delta bellow the name
-        M5.Lcd.setFreeFont(FSSB24);
-        M5.Lcd.setTextColor(TFT_LIGHTGREY, BLACK);
-        M5.Lcd.setTextSize(1);
-        M5.Lcd.fillRect(0,48+10,199,47,TFT_BLACK);
-        M5.Lcd.drawString(ns.delta_display, 0, 48+10, GFXFF);
-        M5.Lcd.setFreeFont(FSSB12);
-      }
-
-      // calculate sensor time difference
-      int sensorDifSec=0;
-      if(!getLocalTime(&timeinfo)){
-        sensorDifSec=24*60*60; // too much
-      } else {
-        Serial.print("Local time: "); Serial.print(timeinfo.tm_hour); Serial.print(":"); Serial.print(timeinfo.tm_min); Serial.print(":"); Serial.print(timeinfo.tm_sec); Serial.print(" DST "); Serial.println(timeinfo.tm_isdst);
-        sensorDifSec=difftime(mktime(&timeinfo), ns.sensTime);
-      }
-      Serial.print("Sensor time difference = "); Serial.print(sensorDifSec); Serial.println(" sec");
-      unsigned int sensorDifMin = (sensorDifSec+30)/60;
-      uint16_t tdColor = TFT_LIGHTGREY;
-      if(sensorDifMin>5) {
-        tdColor = TFT_WHITE;
-        if(sensorDifMin>15) {
-          tdColor = TFT_RED;
-        }
-      }
-
-      M5.Lcd.fillRoundRect(200,0,120,90,15,tdColor);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setFreeFont(FSSB24);
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setTextColor(TFT_BLACK, tdColor);
-      if(sensorDifMin>99) {
-        M5.Lcd.drawString("Err", 260, 32, GFXFF);
-      } else {
-        M5.Lcd.drawNumber(sensorDifMin, 260, 32, GFXFF);
-      }
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setFreeFont(FSSB12);
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setTextColor(TFT_BLACK, tdColor);
-      M5.Lcd.drawString("min", 260, 70, GFXFF);
-      
-      uint16_t glColor = TFT_GREEN;
-      if(ns.sensSgv<cfg.yellow_low || ns.sensSgv>cfg.yellow_high) {
-        glColor=TFT_YELLOW; // warning is YELLOW
-      }
-      if(ns.sensSgv<cfg.red_low || ns.sensSgv>cfg.red_high) {
-        glColor=TFT_RED; // alert is RED
-      }
-    
-      sprintf(tmpstr, "Glyk: %4.1f %s", ns.sensSgv, ns.sensDir);
-      Serial.println(tmpstr);
-      
-      M5.Lcd.fillRect(0, 110, 320, 114, TFT_BLACK);
-      M5.Lcd.setTextSize(2);
-      M5.Lcd.setTextDatum(TL_DATUM);
-      M5.Lcd.setTextColor(glColor, TFT_BLACK);
-      char sensSgvStr[30];
-      int smaller_font = 0;
-      if( cfg.show_mgdl ) {
-        sprintf(sensSgvStr, "%3.0f", ns.sensSgvMgDl);
-      } else {
-        sprintf(sensSgvStr, "%4.1f", ns.sensSgv);
-        if( sensSgvStr[0]!=' ' )
-          smaller_font = 1;
-      }
-      // Serial.print("SGV string length = "); Serial.print(strlen(sensSgvStr));
-      // Serial.print(", smaller_font = "); Serial.println(smaller_font);
-      if( smaller_font ) {
-        M5.Lcd.setFreeFont(FSSB18);
-        M5.Lcd.drawString(sensSgvStr, 0, 130, GFXFF);
-      } else {
-        M5.Lcd.setFreeFont(FSSB24);
-        M5.Lcd.drawString(sensSgvStr, 0, 120, GFXFF);
-      }
-      int tw=M5.Lcd.textWidth(sensSgvStr);
-      int th=M5.Lcd.fontHeight(GFXFF);
-      // Serial.print("textWidth="); Serial.println(tw);
-      // Serial.print("textHeight="); Serial.println(th);
-    
-      if(ns.arrowAngle!=180)
-        drawArrow(0+tw+25, 120+40, 10, ns.arrowAngle+85, 40, 40, glColor);
-    
-      /*
-      // draw help lines
-      for(int i=0; i<320; i+=40) {
-        M5.Lcd.drawLine(i, 0, i, 240, TFT_DARKGREY);
-      }
-      for(int i=0; i<240; i+=30) {
-        M5.Lcd.drawLine(0, i, 320, i, TFT_DARKGREY);
-      }
-      M5.Lcd.drawLine(0, 120, 320, 120, TFT_LIGHTGREY);
-      M5.Lcd.drawLine(160, 0, 160, 240, TFT_LIGHTGREY);
-      */
-
-      drawMiniGraph(&ns);
-      handleAlarmsInfoLine(&ns);
-      drawLogWarningIcon();
-    }
-    break;
-    
-    case 1: {
-      // readNightscout(cfg.url, cfg.token, &ns);
-      
-      uint16_t glColor = TFT_GREEN;
-      if(ns.sensSgv<cfg.yellow_low || ns.sensSgv>cfg.yellow_high) {
-        glColor=TFT_YELLOW; // warning is YELLOW
-      }
-      if(ns.sensSgv<cfg.red_low || ns.sensSgv>cfg.red_high) {
-        glColor=TFT_RED; // alert is RED
-      }
-    
-      sprintf(tmpstr, "Glyk: %4.1f %s", ns.sensSgv, ns.sensDir);
-      Serial.println(tmpstr);
-      
-      M5.Lcd.fillRect(0, 40, 320, 180, TFT_BLACK);
-      M5.Lcd.setTextSize(4);
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setTextColor(glColor, TFT_BLACK);
-      char sensSgvStr[30];
-      int smaller_font = 0;
-      if( cfg.show_mgdl ) {
-        if(ns.sensSgvMgDl<100) {
-          sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
-          M5.Lcd.setFreeFont(FSSB24);
-        } else {
-          sprintf(sensSgvStr, "%3.0f", ns.sensSgvMgDl);
-          M5.Lcd.setFreeFont(FSSB24);
-        }
-      } else {
-        if(ns.sensSgv<10) {
-          sprintf(sensSgvStr, "%3.1f", ns.sensSgv);
-          M5.Lcd.setFreeFont(FSSB24);
-        } else {
-          sprintf(sensSgvStr, "%4.1f", ns.sensSgv);
-          M5.Lcd.setFreeFont(FSSB18);
-        }
-      }
-      M5.Lcd.drawString(sensSgvStr, 160, 120, GFXFF);
-    
-      M5.Lcd.fillRect(0, 0, 320, 40, TFT_BLACK);
-      M5.Lcd.setFreeFont(FSSB24);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setTextDatum(TL_DATUM);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-
-      char datetimeStr[30];
-      struct tm timeinfo;
-      if(cfg.show_current_time) {
-        if(getLocalTime(&timeinfo)) {
-          sprintf(datetimeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);  
-        } else {
-          strcpy(datetimeStr, "??:??");
-        }
-      } else {
-        sprintf(datetimeStr, "%02d:%02d", ns.sensTm.tm_hour, ns.sensTm.tm_min);
-      }
-      M5.Lcd.drawString(datetimeStr, 0, 0, GFXFF);
-      
-      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Lcd.drawString(ns.delta_display, 180, 0, GFXFF);
-
-      int ay=0;
-
-      // for(ns.arrowAngle=-90; ns.arrowAngle<=90; ns.arrowAngle+=15)
-
-      if(ns.arrowAngle>=45)
-        ay=4;
-      else
-        if(ns.arrowAngle>-45)
-          ay=18;
-        else
-          ay=30;
-      
-      if(ns.arrowAngle!=180)
-        drawArrow(280, ay, 10, ns.arrowAngle+85, 28, 28, glColor);
- 
-      handleAlarmsInfoLine(&ns);
-      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
-      drawLogWarningIcon();
-    }
-    break;
-   
-    case 2: {
-      // calculate SGV color
-      uint16_t glColor = TFT_GREEN;
-      if(ns.sensSgv<cfg.yellow_low || ns.sensSgv>cfg.yellow_high) {
-        glColor=TFT_YELLOW; // warning is YELLOW
-      }
-      if(ns.sensSgv<cfg.red_low || ns.sensSgv>cfg.red_high) {
-        glColor=TFT_RED; // alert is RED
-      }
-
-      // display SGV
-      sprintf(tmpstr, "Glyk: %4.1f %s", ns.sensSgv, ns.sensDir);
-      Serial.println(tmpstr);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setTextDatum(TL_DATUM);
-      M5.Lcd.setTextColor(glColor, TFT_BLACK);
-      char sensSgvStr[30];
-      int smaller_font = 0;
-      if( cfg.show_mgdl ) {
-        if(ns.sensSgvMgDl<100) {
-          sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
-          M5.Lcd.setFreeFont(FSSB24);
-        } else {
-          sprintf(sensSgvStr, "%3.0f", ns.sensSgvMgDl);
-          M5.Lcd.setFreeFont(FSSB24);
-        }
-      } else {
-        if(ns.sensSgv<10) {
-          sprintf(sensSgvStr, "%3.1f", ns.sensSgv);
-          M5.Lcd.setFreeFont(FSSB24);
-        } else {
-          sprintf(sensSgvStr, "%4.1f", ns.sensSgv);
-          M5.Lcd.setFreeFont(FSSB24); //18
-        }
-      }
-      M5.Lcd.fillRect(0, 0, 100, 40, TFT_BLACK);
-      M5.Lcd.drawString(sensSgvStr, 0, 0, GFXFF);
-
-      // display DELTA
-      M5.Lcd.setTextDatum(TR_DATUM);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      M5.Lcd.fillRect(220, 0, 100, 40, TFT_BLACK);
-      M5.Lcd.drawString(ns.delta_display, 319, 0, GFXFF);
-
-      // get time - need update
-      char datetimeStr[30];
-      struct tm timeinfo;
-      if(cfg.show_current_time) {
-        if(getLocalTime(&timeinfo)) {
-          sprintf(datetimeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);  
-        } else {
-          strcpy(datetimeStr, "??:??");
-        }
-      } else {
-        sprintf(datetimeStr, "%02d:%02d", ns.sensTm.tm_hour, ns.sensTm.tm_min);
-      }
+          /// codes for writing from client to server         
           
-      // calculate sensor time difference
-      int sensorDifSec=0;
-      if(!getLocalTime(&timeinfo)){
-        sensorDifSec=24*60*60; // too much
-      } else {
-        Serial.print("Local time: "); Serial.print(timeinfo.tm_hour); Serial.print(":"); Serial.print(timeinfo.tm_min); Serial.print(":"); Serial.print(timeinfo.tm_sec); Serial.print(" DST "); Serial.println(timeinfo.tm_isdst);
-        sensorDifSec=difftime(mktime(&timeinfo), ns.sensTime);
-      }
-      Serial.print("Sensor time difference = "); Serial.print(sensorDifSec); Serial.println(" sec");
-      unsigned int sensorDifMin = (sensorDifSec+30)/60;
-      uint16_t tdColor = TFT_LIGHTGREY;
-      if(sensorDifMin>5) {
-        tdColor = TFT_WHITE;
-        if(sensorDifMin>15) {
-          tdColor = TFT_RED;
-        }
-      }
-      // display time since last valid data
-      M5.Lcd.fillRoundRect(0, 44, 68, 22, 7, tdColor);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setFreeFont(FSS9);
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setTextColor(TFT_BLACK, tdColor);
-      if(sensorDifMin>99) {
-        M5.Lcd.drawString("Err min", 34, 53, GFXFF);
-      } else {
-        M5.Lcd.drawString(String(sensorDifMin)+" min", 34, 53, GFXFF);
-      }
-
-      // draw temperature
-      float tmprc=dht12.readTemperature(cfg.temperature_unit);
-      // Serial.print("tmprc="); Serial.println(tmprc);
-      if(tmprc!=float(0.01) && tmprc!=float(0.02) && tmprc!=float(0.03)) { // not an error
-        M5.Lcd.setTextDatum(BL_DATUM);
-        M5.Lcd.setFreeFont(FSS12); // CF_RT24
-        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        String tmprcStr=String(tmprc, 1);
-        int tw=M5.Lcd.textWidth(tmprcStr);
-        M5.Lcd.fillRect(0, 180, 88, 30, TFT_BLACK);
-        M5.Lcd.drawString(tmprcStr, 7, 210, GFXFF);
-        M5.Lcd.setFreeFont(FSS9);
-        int ow=M5.Lcd.textWidth("o");
-        M5.Lcd.drawString("o", 7+tw+2, 199, GFXFF);
-        M5.Lcd.setFreeFont(FSS12);
-        switch(cfg.temperature_unit) {
-          case 1:
-            M5.Lcd.drawString("C", 7+tw+ow+4, 210, GFXFF);
-            break;
-          case 2:
-            M5.Lcd.drawString("K", 7+tw+ow+4, 210, GFXFF);
-            break;
-          case 3:
-            M5.Lcd.drawString("F", 7+tw+ow+4, 210, GFXFF);
-            break;
-        }
-      }
-      
-      // display humidity
-      float humid=dht12.readHumidity();
-      // Serial.print("humid="); Serial.println(humid);
-      if(humid!=float(0.01) && humid!=float(0.02) && humid!=float(0.03)) { // not an error
-        M5.Lcd.setTextDatum(BR_DATUM);
-        M5.Lcd.setFreeFont(FSS12);
-        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        String humidStr=String(humid, 0);
-        humidStr += "%";
-        M5.Lcd.fillRect(250, 185, 70, 25, TFT_BLACK);
-        M5.Lcd.drawString(humidStr, 310, 210, GFXFF);
-      }
-
-      // draw clock
-      float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;    // Saved H, M, S x & y multipliers
-      float sdeg=0, mdeg=0, hdeg=0;
-      uint16_t x0=0, x1=0, yy0=0, yy1=0;
-    
-      uint8_t hh=timeinfo.tm_hour, mm=timeinfo.tm_min, ss=timeinfo.tm_sec;  // Get current time
-
-      // Draw clock face
-      M5.Lcd.fillCircle(160, 110, 98, glColor);
-      M5.Lcd.fillCircle(160, 110, 92, TFT_BLACK);
-    
-      // Draw 12 lines
-      for(int i = 0; i<360; i+= 30) {
-        sx = cos((i-90)*0.0174532925);
-        sy = sin((i-90)*0.0174532925);
-        x0 = sx*94+160;
-        yy0 = sy*94+110;
-        x1 = sx*80+160;
-        yy1 = sy*80+110;
-    
-        M5.Lcd.drawLine(x0, yy0, x1, yy1, glColor);
-      }
-      
-      // Draw 60 dots
-      for(int i = 0; i<360; i+= 6) {
-        sx = cos((i-90)*0.0174532925);
-        sy = sin((i-90)*0.0174532925);
-        x0 = sx*82+160;
-        yy0 = sy*82+110;
-        // Draw minute markers
-        M5.Lcd.drawPixel(x0, yy0, TFT_WHITE);
-        
-        // Draw main quadrant dots
-        if(i==0 || i==180) M5.Lcd.fillCircle(x0, yy0, 2, TFT_WHITE);
-        if(i==90 || i==270) M5.Lcd.fillCircle(x0, yy0, 2, TFT_WHITE);
-      }
-    
-      M5.Lcd.fillCircle(160, 110, 3, TFT_WHITE);
-
-      // draw day
-      M5.Lcd.drawRoundRect(182, 97, 36, 26, 7, TFT_LIGHTGREY);
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      M5.Lcd.setFreeFont(FSSB9);
-      M5.Lcd.drawString(String(timeinfo.tm_mday), 200, 108, GFXFF);
-    
-      // draw name
-      M5.Lcd.setTextDatum(MC_DATUM);
-      M5.Lcd.setFreeFont(FSSB9);
-      M5.Lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-      M5.Lcd.drawString(cfg.userName, 160, 145, GFXFF);
-  
-      // Pre-compute hand degrees, x & y coords for a fast screen update
-      sdeg = ss*6;                  // 0-59 -> 0-354
-      mdeg = mm*6+sdeg*0.01666667;  // 0-59 -> 0-360 - includes seconds
-      hdeg = hh*30+mdeg*0.0833333;  // 0-11 -> 0-360 - includes minutes and seconds
-      hx = cos((hdeg-90)*0.0174532925);    
-      hy = sin((hdeg-90)*0.0174532925);
-      mx = cos((mdeg-90)*0.0174532925);    
-      my = sin((mdeg-90)*0.0174532925);
-      sx = cos((sdeg-90)*0.0174532925);    
-      sy = sin((sdeg-90)*0.0174532925);
-
-      if (ss==0 || initial) {
-        initial = 0;
-        // Erase hour and minute hand positions every minute
-        M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_BLACK);
-        M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_BLACK);
-        M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_BLACK);
-        M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_BLACK);
-        M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_BLACK);
-        ohx = hx*52+160;    
-        ohy = hy*52+110;
-        M5.Lcd.drawLine(omx, omy, 160, 110, TFT_BLACK);
-        omx = mx*74+160;    
-        omy = my*74+110;
-      }
-  
-      // Redraw new hand positions, hour and minute hands not erased here to avoid flicker
-      M5.Lcd.drawLine(osx, osy, 160, 110, TFT_BLACK);
-      osx = sx*78+160;    
-      osy = sy*78+110;
-      M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_WHITE);
-      M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_WHITE);
-      M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_WHITE);
-      M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_WHITE);
-      M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_WHITE);
-      M5.Lcd.drawLine(omx, omy, 160, 110, TFT_WHITE);
-      M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
-  
-      M5.Lcd.fillCircle(160, 110, 3, TFT_RED);      
-
-      // draw angle arrow  
-      int ay=0;
-      if(ns.arrowAngle>=45)
-        ay=4;
-      else
-        if(ns.arrowAngle>-45)
-          ay=18;
-        else
-          ay=30;
-      M5.Lcd.fillRect(262, 80, 58, 60, TFT_BLACK);
-      if(ns.arrowAngle!=180)
-        drawArrow(280, ay+90, 10, ns.arrowAngle+85, 28, 28, glColor);
-        
-      handleAlarmsInfoLine(&ns);
-      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
-      drawLogWarningIcon();
-    }
-    break;
-    
-    case MAX_PAGE: {
-      // display error log
-      char tmpStr[32];
-      HTTPClient http;
-      M5.Lcd.fillScreen(BLACK);
-      M5.Lcd.setCursor(0, 18);
-      M5.Lcd.setTextDatum(TL_DATUM);
-      M5.Lcd.setFreeFont(FMB9);
-      M5.Lcd.setTextSize(1); 
-      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Lcd.drawString("Date  Time  Error Log", 0, 0, GFXFF);
-      // M5.Lcd.drawString("Error", 143, 0, GFXFF);
-      M5.Lcd.setFreeFont(FM9);
-      if(err_log_ptr==0) {
-        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        M5.Lcd.drawString("no errors in log", 0, 20, GFXFF);
-      } else {
-        for(int i=0; i<err_log_ptr; i++) {
-          M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-          sprintf(tmpStr, "%02d.%02d.%02d:%02d", err_log[i].err_time.tm_mday, err_log[i].err_time.tm_mon+1, err_log[i].err_time.tm_hour, err_log[i].err_time.tm_min);
-          M5.Lcd.drawString(tmpStr, 0, 20+i*18, GFXFF);
-          if(err_log[i].err_code<0) {
-            M5.Lcd.setTextColor(TFT_RED, TFT_BLACK);
-            strlcpy(tmpStr, http.errorToString(err_log[i].err_code).c_str(), 32);
-          } else {
-            M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-            switch(err_log[i].err_code) {
-              case 1001:
-                strcpy(tmpStr, "JSON parsing failed");
-                break;
-              case 1002:
-                strcpy(tmpStr, "No data from Nightscout");
-                break;
-              case 1003:
-                strcpy(tmpStr, "JSON2 parsing failed");
-                break;
-              default:              
-                sprintf(tmpStr, "HTTP error %d", err_log[i].err_code);
-            }
+          case 0x01:{
+             Serial.println(F("received opcode for writeNightScoutUrlTx"));
+             // if it's a long url, we will receive multiple packets, the packet number is the second byte, starting at 1, the total number of 
+             // packets is byte 2, then the contents start as of the 4th byte
+             // there might still be packets coming 
+             std::strcpy (cfg.url + (rxValueAsByteArray[1] - 1) * (maxBytesInOneBLEPacket - 3), rxValue.c_str() + 3);
+             if (rxValueAsByteArray[1] == rxValueAsByteArray[2]) {
+              if (debugLogging) {Serial.print("received all packets, url = ");Serial.println(cfg.url);}
+              configureTargetServerAndUrl(cfg.url, cfg.token);
+              connectToWiFiIfNightScoutUrlExists();
+             }
           }
-          M5.Lcd.drawString(tmpStr, 132, 20+i*18, GFXFF);
-        }
-        M5.Lcd.setFreeFont(FMB9);
-        M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-        sprintf(tmpStr, "Total errors %d", err_log_count);
-        M5.Lcd.drawString(tmpStr, 0, 20+err_log_ptr*18, GFXFF);
-      }
-      handleAlarmsInfoLine(&ns);
-      drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
-      drawLogWarningIcon();
-    }
-    break;
-  }
-}
+          break;
+          
+          case 0x02:{
+             Serial.println(F("received opcode for writeNightScoutAPIKeyTx"));
+             std::strcpy (cfg.token + (rxValueAsByteArray[1] - 1) * (maxBytesInOneBLEPacket - 3), rxValue.c_str() + 3);
+             if (rxValueAsByteArray[1] == rxValueAsByteArray[2]) {
+              if (debugLogging) {Serial.print("received all packets, token = ");Serial.println(cfg.token);}
+              configureTargetServerAndUrl(cfg.url, cfg.token);
+             }
 
-// the loop routine runs over and over again forever
-void loop(){
-  delay(20);
-  buttons_test();
+          }
+          break;
+          
+          case 0x03:{
+            char * unitismgdl = new char[6];// value is literally "true" or "false"
+             Serial.println(F("received opcode for writemgdlTx"));
+             std::strcpy (unitismgdl, rxValue.c_str() + 3);// starts at postion 4, because split in packets is used
+             if (strcmp(unitismgdl, "true") == 0) {
+              cfg.show_mgdl = 0;
+             } else {
+              cfg.show_mgdl = 1;
+             }
+             updateGlycemia();
+             delete[] unitismgdl;
+          }
+          break;
+          
+          case 0x04:
+             Serial.println(F("received opcode for writebrightness1Tx"));
+          break;
+          
+          case 0x05:
+             Serial.println(F("received opcode for writebrightness2Tx"));
+          break;
+          
+          case 0x06:
+             Serial.println(F("received opcode for writebrightness3Tx"));
+          break;
+          
+          case 0x07: {
+             Serial.println(F("received opcode for writeWlanSSIDTx"));
+             if (rxValueAsByteArray[1] == 1) {// it's the first packet, the first byte is the number of the wifi name
+                
+                //0 is ascii code 48, that means for instance if rxValueAsByteArray[3] = 49, then the actual number is 1
+                // but from that we need to substract further one, because indexing starts at 0
+                indexForWifiNamesAndPasswords = rxValueAsByteArray[3] - 48 - 1;
+                
+                std::strcpy (cfg.wlanssid[indexForWifiNamesAndPasswords], rxValue.c_str() + 4);
+                
+             } else if (rxValueAsByteArray[1] == 2) {// second packet
+                std::strcpy (cfg.wlanssid[indexForWifiNamesAndPasswords] + maxBytesInOneBLEPacket - 4, rxValue.c_str() + 3);
+             } else {// third or fourth, ...  packet
+                std::strcpy (cfg.wlanssid[indexForWifiNamesAndPasswords] + (maxBytesInOneBLEPacket - 4) + (rxValueAsByteArray[1] - 2) * (maxBytesInOneBLEPacket - 3), rxValue.c_str() + 3);
+             }
+             
+             if (rxValueAsByteArray[1] == rxValueAsByteArray[2]) {
+                // all packets received
+                if (debugLogging) {Serial.print("received all packets, cfg.wlanssid = ");Serial.println(cfg.wlanssid[indexForWifiNamesAndPasswords]);}
+             }
 
-  // update glycemia every 15s
-  if(millis()-msCount>15000) {
-    /* if(dispPage==2)
-      M5.Lcd.drawLine(osx, osy, 160, 111, TFT_BLACK); // erase seconds hand while updating data
-    */
-    readNightscout(cfg.url, cfg.token, &ns);
-    draw_page();
-    msCount = millis();  
-    Serial.print("msCount = "); Serial.println(msCount);
-  } else {
-    if((cfg.restart_at_logged_errors>0) && (err_log_count>=cfg.restart_at_logged_errors)) {
-      preferences.begin("M5StackNS", false);
-      preferences.putBool("SoftReset", true);
-      preferences.putUInt("LastSnoozeTime", lastSnoozeTime);
-      preferences.end();
-      ESP.restart();
-    }
-    char lastResetTime[10];
-    strcpy(lastResetTime, "Unknown");
-    if(getLocalTime(&localTimeInfo)) {
-      sprintf(localTimeStr, "%02d:%02d", localTimeInfo.tm_hour, localTimeInfo.tm_min);
-      // no soft restart less than a minute from last restart to prevent several restarts in the same minute
-      if((millis()-msStart>60000) && (strcmp(cfg.restart_at_time, localTimeStr)==0)) {
-        preferences.begin("M5StackNS", false);
-        preferences.putBool("SoftReset", true);
-        preferences.putUInt("LastSnoozeTime", lastSnoozeTime);
-        preferences.end();
-        ESP.restart();
-      }
-    }
-    if((dispPage==0) && cfg.show_current_time) {
-      // update current time on display
-      M5.Lcd.setFreeFont(FSSB12);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      if(getLocalTime(&localTimeInfo)) {
-        switch(cfg.date_format) {
-          case 1:
-            sprintf(localTimeStr, "%02d:%02d  %d/%d  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mon+1, localTimeInfo.tm_mday);
+          }
+          break;
+          
+          case 0x08:{
+             Serial.println(F("received opcode for writeWlanPassTx"));
+
+             if (rxValueAsByteArray[1] == 1) {// it's the first packet, the first byte is the number of the password
+                
+                //0 is ascii code 48, that means for instance if rxValueAsByteArray[3] = 49, then the actual number is 1
+                // but from that we need to substract further one, because indexing starts at 0
+                indexForWifiNamesAndPasswords = rxValueAsByteArray[3] - 48 - 1;
+                
+                std::strcpy (cfg.wlanpass[indexForWifiNamesAndPasswords], rxValue.c_str() + 4);
+                
+             } else if (rxValueAsByteArray[1] == 2) {// second packet
+                std::strcpy (cfg.wlanpass[indexForWifiNamesAndPasswords] + maxBytesInOneBLEPacket - 4, rxValue.c_str() + 3);
+             } else {// third or fourth, ...  packet
+                std::strcpy (cfg.wlanpass[indexForWifiNamesAndPasswords] + (maxBytesInOneBLEPacket - 4) + (rxValueAsByteArray[1] - 2) * (maxBytesInOneBLEPacket - 3), rxValue.c_str() + 3);
+             }
+             
+             if (rxValueAsByteArray[1] == rxValueAsByteArray[2]) {
+                // all packets received
+                if (debugLogging) {Serial.print("received all packets, cfg.wlanssid = ");Serial.println(cfg.wlanpass[indexForWifiNamesAndPasswords]);}
+             }
+
+
+          }
+          break;
+
+          case 0x09: {
+             Serial.println(F("received opcode for readBlePassWordTx"));
+
+             // client is requesting the blepassword - if cfg.blepassword has length > 0, then it means it should already be known by the app, we won't send it. 
+             // this is to prevent that some other app requests it
+             if (sizeOfStringInCharArray(cfg.blepassword, 64) == 0) {// here in this case useConfiguredBlePassword must be false
+               Serial.println(F("current blepassword has length 0, creating a new one and will send this to client"));
+               for(int i = 0; i<10  ; i++) {
+                 cfg.blepassword[i] = letters[random(0, 36)];
+               }
+               
+               sendTextToBLEClient(cfg.blepassword, 0x0E, 64);
+
+               // considering this case as authenticated
+               bleAuthenticated = true;
+               
+             } else if (useConfiguredBlePassword) {
+                Serial.println(F("'Error - 1 -  User should set password in settings', sending 0x0D to client"));
+                sendTextToBLEClient("", 0x0D, 0);
+                
+             } else { // useConfiguredBlePassword is false and cfg.blepassword already exists, means it's already randomly generated
+                Serial.println(F("blepassword has length > 0, 'Error - 2 - Password already known, user should reset M5Stack', sending 0x0F to client"));
+                sendTextToBLEClient("", 0x0F, 0);
+             }
+          }
+          break;
+          
+          case 0x0A: {//authenticateTx
+             Serial.println(F("received opcode for authenticateTx"));
+             // client is trying authentication, in case cfg.blepassword is currently 0, then we're in a situation where there's no password in the config, a new random password hasn't been
+             // generated yet, the app still has an old stored temporary password, but which needs to be renewed
+             if (sizeOfStringInCharArray(cfg.blepassword, 64) == 0) {
+                 Serial.println(F("blepassword has length 0, creating a new one and will send this to client"));
+                 for(int i = 0; i<10; i++) {
+                    cfg.blepassword[i] = letters[random(0, 36)];
+                 }
+                 sendTextToBLEClient(cfg.blepassword, 0x0E, 64);
+                 
+                 // considering this case as authenticated
+                 bleAuthenticated = true;
+               
+             } else {
+               // verify the password
+               bool passwordMatch = false;
+               if ((sizeOfStringInCharArray(cfg.blepassword, 64) + 1) == rxValue.length()) {// rxValue is opCode + password, meaning should be 1 longer than actual password, if that's not the case then password doesn't match
+                Serial.println(F("password length correct"));
+                passwordMatch = true;
+                 for (int i = 0; i < sizeOfStringInCharArray(cfg.blepassword, 64); i++) {
+                    if (cfg.blepassword[i] != rxValueAsByteArray[i+1]) {
+                      passwordMatch = false;
+                      Serial.println(F("password doesn't match"));
+                      break;
+                    }
+                 }
+               } else {
+                  Serial.println(F("password length not correct"));
+               }
+
+                if (passwordMatch) {
+                  Serial.println(F("sending opcode authenticateSuccessRx to client"));
+                  sendTextToBLEClient("", 0x0B, 0);
+                  bleAuthenticated = true;
+                } else {
+                  Serial.println(F("sending opcode authenticateFailureRx to client, user should switch off-on the M5stack or set the right password in the app"));
+                  sendTextToBLEClient("", 0x0C, 0);
+                  
+                  // disconnect because it may be an untrusted device that is trying to connect
+                 pService->stop();
+                 // resetup ble so that the M5stack restarts advertising
+                 setupBLE();
+                 
+                  // set bleAuthenticated to false
+                  bleAuthenticated = false;
+                }
+
+               
+             }
+            }
             break;
-          default:
-            sprintf(localTimeStr, "%02d:%02d  %d.%d.  ", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_mday, localTimeInfo.tm_mon+1);
+
+             case 0x10: {
+                Serial.println(F("received opcode for bgReadingTx"));
+                // should be one packet, will not start to compose packets, string starts at byte 3 (ie index 2), here it's multiplied with 2
+
+                if (bleAuthenticated) {
+
+                    // first field is bgReading in mgdl as Int, which starts in byte 3 of rxValue.c_str(),
+                    // first copy to c string because functions used require this
+                    char * cstr = new char [rxValue.length() + 1 - 3];
+                    std::strcpy (cstr, rxValue.c_str() + 3);
+
+                    // splitByBlanc is assigned to first field before the blanc
+                    char * splitByBlanc = strtok (cstr," ");
+                    ns.sensSgv = float(atoi(splitByBlanc));
+
+                    // strange but this assigned splitByBlanc to the next field
+                    splitByBlanc = strtok (NULL," ");
+                    ns.rawtime = uint64_t(strtoul(splitByBlanc, NULL, 10)) * 1000;
+                    
+                    ns.sensTime = ns.rawtime / 1000; 
+                    timeStampLatestBgReadingInSecondsUTC = ns.sensTime; 
+                    ns.sensSgvMgDl = ns.sensSgv;
+                    ns.sensSgv/=18.0;
+                    localtime_r(&ns.sensTime, &ns.sensTm);
+
+                    
+                    updateGlycemia();
+                    msCount = millis();  
+                    
+                    delete[] cstr;
+                    
+                } else {
+                    Serial.println(F("BLE Not authenticated"));
+                }
+             }
+             break;
+
+             case 0x12: {
+                Serial.println(F("received opcode for writeTimeStampTx"));
+                // should be one packet, will not start to compose packets, string starts at byte 3 (ie index 2), here it's multiplied with 2
+
+                if (bleAuthenticated) {
+                    localTimeStampInSecondsRetrievedFromBLEClient = strtoul(rxValue.c_str() + 3, NULL, 0);
+                    milliSecondsSinceRetrievalTimeStampInSecondsRetrievedFromBLEClient = millis();
+
+                    if (initialBLEStartUpOnGoing) {
+                      // ask upate all parameters
+                      Serial.println(F("sending opcode readAllParametersRx to client"));
+                      sendTextToBLEClient("", 0x16, 0);
+
+                      initialBLEStartUpOnGoing = false;
+                    }
+                }
+                
+             }
+             break;
+
+             case 0x13: {
+                Serial.println(F("received opcode for writeSlopeNameTx"));
+                if (bleAuthenticated) {
+                  strlcpy(ns.sensDir, rxValue.c_str() + 3, 32); 
+                  setNsArrowAngle();  
+                }
+                
+             }
+             break;
+
+             case 0x14: {
+                Serial.println(F("received opcode for writeTimeOffsetTx"));
+                if (bleAuthenticated) {
+                  diffBetweenLocalTimeAndUTCTime = strtoul(rxValue.c_str() + 3, NULL, 0);
+                }
+             }
+             break;
+
+             case 0x15: {
+                Serial.println(F("received opcode for writeTextColorTx"));
+                if (bleAuthenticated) {
+                  
+                    textColor = rxValueAsByteArray[1] * 256 + rxValueAsByteArray[2];
+                    Serial.print(F("textcolor value = "));Serial.println(textColor);
+                    
+                    // reinitialize previousSensSgvStr, to force a redisplay of the screen when calling updateGlycemia
+                    strcpy(previousSensSgvStr, "");
+
+                    // set new textcolor
+                    M5.Lcd.setTextColor(textColor, TFT_BLACK);
+                    updateGlycemia();
+                }
+             }
+             break;
+             
+          
         }
-      } else {
-        strcpy(localTimeStr, "??:??");
-        lastMin = 61;
-      }
-      if(lastMin!=localTimeInfo.tm_min) {
-        lastSec=localTimeInfo.tm_sec;
-        lastMin=localTimeInfo.tm_min;
-        M5.Lcd.drawString(localTimeStr, 0, 0, GFXFF);
       }
     }
-    if(dispPage==2) {
-      if(getLocalTime(&localTimeInfo)) {
-        // sprintf(localTimeStr, "%02d:%02d:%02d", localTimeInfo.tm_hour, localTimeInfo.tm_min, localTimeInfo.tm_sec);
-      } else {
-        lastMin = 61;
-        lastSec = 61;
-      }
-      if(lastMin!=localTimeInfo.tm_min || lastSec!=localTimeInfo.tm_sec) {
-        lastSec=localTimeInfo.tm_sec;
-        lastMin=localTimeInfo.tm_min;
-        
-        float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;    // Saved H, M, S x & y multipliers
-        float sdeg=0, mdeg=0, hdeg=0;
-      
-        uint8_t hh=localTimeInfo.tm_hour, mm=localTimeInfo.tm_min, ss=localTimeInfo.tm_sec;  // Get current time
-        
-        // Pre-compute hand degrees, x & y coords for a fast screen update
-        sdeg = ss*6;                  // 0-59 -> 0-354
-        mdeg = mm*6+sdeg*0.01666667;  // 0-59 -> 0-360 - includes seconds
-        hdeg = hh*30+mdeg*0.0833333;  // 0-11 -> 0-360 - includes minutes and seconds
-        hx = cos((hdeg-90)*0.0174532925);    
-        hy = sin((hdeg-90)*0.0174532925);
-        mx = cos((mdeg-90)*0.0174532925);    
-        my = sin((mdeg-90)*0.0174532925);
-        sx = cos((sdeg-90)*0.0174532925);    
-        sy = sin((sdeg-90)*0.0174532925);
+};
+
+class BLEServerCallBack: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      Serial.println(F("BLE connect"));
+      bleDeviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      Serial.println(F("BLE disconnect"));
+      bleDeviceConnected = false;
+
+      // need to set authenticated to false, because the M5Stack will immediately start advertising again, so another client might connect
+      bleAuthenticated = false;
+    }
+};
+
+void setupBLE() {
   
-        if (ss==0 || initial) {
-          initial = 0;
-          // Erase hour and minute hand positions every minute
-          M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_BLACK);
-          M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_BLACK);
-          M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_BLACK);
-          M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_BLACK);
-          M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_BLACK);
-          ohx = hx*52+160;    
-          ohy = hy*52+110;
-          M5.Lcd.drawLine(omx, omy, 160, 110, TFT_BLACK);
-          omx = mx*74+160;    
-          omy = my*74+110;
-        }
+  Serial.begin(115200);
+  Serial.println(F("Starting BLE"));
 
-        // erase old seconds hand position
-        M5.Lcd.drawLine(osx, osy, 160, 110, TFT_BLACK);
-    
-        // draw day
-        M5.Lcd.drawRoundRect(182, 97, 36, 26, 7, TFT_LIGHTGREY);
-        M5.Lcd.setTextDatum(MC_DATUM);
-        M5.Lcd.setFreeFont(FSSB9);
-        M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        M5.Lcd.drawString(String(localTimeInfo.tm_mday), 200, 108, GFXFF);
-     
-        // draw name
-        M5.Lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Lcd.drawString(cfg.userName, 160, 145, GFXFF);
-    
-        // draw digital time
-        // M5.Lcd.drawString(localTimeStr, 160, 75, GFXFF);
-        
-        // Redraw new hand positions, hour and minute hands not erased here to avoid flicker
-        osx = sx*78+160;    
-        osy = sy*78+110;
-        // M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
-        M5.Lcd.drawLine(ohx, ohy, 160, 110, TFT_WHITE);
-        M5.Lcd.drawLine(ohx+1, ohy, 161, 110, TFT_WHITE);
-        M5.Lcd.drawLine(ohx-1, ohy, 159, 110, TFT_WHITE);
-        M5.Lcd.drawLine(ohx, ohy-1, 160, 109, TFT_WHITE);
-        M5.Lcd.drawLine(ohx, ohy+1, 160, 111, TFT_WHITE);
-        M5.Lcd.drawLine(omx, omy, 160, 110, TFT_WHITE);
-        M5.Lcd.drawLine(osx, osy, 160, 110, TFT_RED);
-    
-        M5.Lcd.fillCircle(160, 110, 3, TFT_RED);
-      }
-      
-    }
-  }
+  BLEDevice::init(BLE_DeviceName.c_str());
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new BLEServerCallBack());
+  pService = pServer->createService(BLE_SERVICE_UUID.c_str());
+  
+  // PROPERTY_WRITE_NR : client can write a value to the characteristic, client does not expect response
+  // PROPERTY_NOTIFY : server can inform client that there's a new value, confirmation from client back to server is not needed
+  // in fact pRxTxCharacteristic will be used to exchange data. Write is from client to server, for example if client needs to know information, it will write a specific command
+  //   to the server, the server will respond with a notify  
+  pRxTxCharacteristic = pService->createCharacteristic(BLE_CHARACTERISTIC_UUID.c_str(), BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY);
 
-  /*
-  if(millis()-msCountLog>5000) {
-    File fileLog = SD.open("/logfile.txt", FILE_WRITE);    
-    if(!fileLog) {
-      Serial.println("Cannot write to logfile.txt");
-    } else {
-      int pos = fileLog.seek(fileLog.size());
-      struct tm timeinfo;
-      getLocalTime(&timeinfo);
-      fileLog.println(asctime(&timeinfo));
-      fileLog.close();
-      Serial.print("Log file written: "); Serial.print(asctime(&timeinfo));
-    }
-    msCountLog = millis();  
-  }  
-  */
+  // needed to make it work as notifier
+  pRxTxCharacteristic->addDescriptor(new BLE2902());
+  
+  pRxTxCharacteristic->setCallbacks(new BLECharacteristicCallBack());
+  
+  // Start the service
+  pService->start();
 
-  // Serial.println("M5.update() and loop again");
-  M5.update();
+  // Start advertising
+  pServer->getAdvertising()->start();
+  
 }
