@@ -38,7 +38,7 @@ void printErrorMessage(uint8_t e, bool eol = true)
     Serial.println();
 }
 
-void readConfiguration(char *iniFilename, tConfig *cfg) {
+void readConfiguration(const char *iniFilename, tConfig *cfg) {
   const size_t bufferLen = 80;
   char buffer[bufferLen];
     
@@ -113,6 +113,16 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
   else {
     Serial.println("NO user name");
     strcpy(cfg->userName, " ");
+  }
+  
+  if (ini.getValue("config", "device_name", buffer, bufferLen)) {
+    Serial.print("device_name = ");
+    Serial.println(buffer);
+    strlcpy(cfg->deviceName, buffer, 32);
+  }
+  else {
+    Serial.println("NO device name defined, default M5NS");
+    strcpy(cfg->deviceName, "M5NS");
   }
   
   if (ini.getValue("config", "time_zone", buffer, bufferLen)) {
@@ -486,23 +496,33 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
     cfg->temperature_unit = 1;
   }
 
+  if (ini.getValue("config", "disable_web_server", buffer, bufferLen)) {
+    Serial.print("disable_web_server = ");
+    cfg->disable_web_server = atoi(buffer);
+    Serial.println(cfg->disable_web_server);
+  }
+  else {
+    Serial.println("NO disable_web_server defined = 0");
+    cfg->disable_web_server = 0;
+  }
+
   for(int i=0; i<=9; i++) {
     char wlansection[10];
     sprintf(wlansection, "wlan%1d", i);
 
     if (ini.getValue(wlansection, "ssid", buffer, bufferLen)) {
-      Serial.printf("[wlan%1d] ssid = %s\n", i, buffer);
-      strlcpy(cfg->wlanssid[i], buffer,32);
+      Serial.printf("[wlan%1d] ssid = %s\r\n", i, buffer);
+      strlcpy(cfg->wlanssid[i], buffer, 32);
     } else {
-      Serial.printf("NO [wlan%1d] ssid\n", i);
+      Serial.printf("NO [wlan%1d] ssid\r\n", i);
       cfg->wlanssid[i][0] = 0;
     }
   
     if (ini.getValue(wlansection, "pass", buffer, bufferLen)) {
-      Serial.printf("[wlan%1d] pass = %s\n", i, buffer);
-      strlcpy(cfg->wlanpass[i], buffer, 32);
+      Serial.printf("[wlan%1d] pass = %s\r\n", i, buffer);
+      strlcpy(cfg->wlanpass[i], buffer, 64);
     } else {
-      Serial.printf("NO [wlan%1d] pass\n", i);
+      Serial.printf("NO [wlan%1d] pass\r\n", i);
       cfg->wlanpass[i][0] = 0;
     }
   }

@@ -25,21 +25,29 @@
     Sulka Haro (Nightscout API queries help)
 */
 
+#include <Arduino.h>
 #include <M5Stack.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include "time.h"
+#include "externs.h"
 // #include <util/eu_dst.h>
 #define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
 #include "Free_Fonts.h"
 #include "IniFile.h"
 #include "M5NSconfig.h"
+#include "M5NSWebConfig.h"
 #include "DHT12.h"
 #include <Wire.h>     //The DHT12 uses I2C comunication.
 DHT12 dht12;          //Preset scale CELSIUS and ID 0x5c.
+
+String M5NSversion("2020021301");
 
 // extern const unsigned char alarmSndData[];
 
@@ -62,6 +70,8 @@ extern const unsigned char plug_icon16x16[];
 Preferences preferences;
 tConfig cfg;
 
+WebServer w3srv(80);
+
 const char* ntpServer = "pool.ntp.org"; // "time.nist.gov", "time.google.com"
 struct tm localTimeInfo;
 int MAX_TIME_RETRY = 30;
@@ -78,6 +88,8 @@ int err_log_count = 0;
 
 int dispPage = 0;
 #define MAX_PAGE 3
+int maxPage = MAX_PAGE;
+
 // icon positions for the first page - WiFi/log, Snooze, Battery
 int icon_xpos[3] = {144, 144+18, 144+2*18};
 int icon_ypos[3] = {0, 0, 0};
@@ -85,57 +97,32 @@ int icon_ypos[3] = {0, 0, 0};
 // analog clock global variables
 uint16_t osx=120, osy=120, omx=120, omy=120, ohx=120, ohy=120;  // Saved H, M, S x & y coords
 boolean initial = 1;
+boolean mDNSactive = false;
 
 #ifndef min
   #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
-WiFiMulti WiFiMulti;
+#ifndef M_PI
+    #define M_PI 3.14159265358979323846
+#endif
+
+void draw_page();
+
+WiFiMulti WiFiMultiple;
+
 unsigned long msCount;
 unsigned long msCountLog;
 unsigned long msStart;
-static uint8_t lcdBrightness = 10;
-static char *iniFilename = "/M5NS.INI";
+uint8_t lcdBrightness = 10;
+const char iniFilename[] = "/M5NS.INI";
 
 DynamicJsonDocument JSONdoc(16384);
 time_t lastAlarmTime = 0;
 time_t lastSnoozeTime = 0;
 static uint8_t music_data[25000]; // 5s in sample rate 5000 samp/s
 
-struct NSinfo {
-  char sensDev[64];
-  uint64_t rawtime = 0;
-  time_t sensTime = 0;
-  struct tm sensTm;
-  char sensDir[32];
-  float sensSgvMgDl = 0;
-  float sensSgv = 0;
-  float last10sgv[10];
-  bool is_xDrip = 0;  
-  bool is_Sugarmate = 0;  
-  int arrowAngle = 180;
-  float iob = 0;
-  char iob_display[16];
-  char iob_displayLine[16];
-  float cob = 0;
-  char cob_display[16];
-  char cob_displayLine[16];
-  int delta_absolute = 0;
-  float delta_elapsedMins = 0;
-  bool delta_interpolated = 0;
-  int delta_mean5MinsAgo = 0;
-  int delta_mgdl = 0;
-  float delta_scaled = 0;
-  char delta_display[16];
-  char loop_display_symbol = '?';
-  char loop_display_code[16];
-  char loop_display_label[16];
-  char basal_display[16];
-  float basal_current = 0;
-  float basal_tempbasal = 0;
-  float basal_combobolusbasal = 0;
-  float basal_totalbasal = 0;
-} ns;
+struct NSinfo ns;
 
 void setPageIconPos(int page) {
   switch(page) {
@@ -189,7 +176,7 @@ void addErrorLog(int code){
 }
 
 void startupLogo() {
-    static uint8_t brightness, pre_brightness;
+    // static uint8_t brightness, pre_brightness;
     M5.Lcd.setBrightness(0);
     if(cfg.bootPic[0]==0) {
       // M5.Lcd.pushImage(0, 0, 320, 240, (uint16_t *)gImage_logoM5);
@@ -350,7 +337,7 @@ void buttons_test() {
     int txw=M5.Lcd.textWidth(tmpStr);
     Serial.print("Set SNOOZE: "); Serial.println(tmpStr);
     M5.Lcd.drawString(tmpStr, 159-txw/2, 220, GFXFF);
-    if(dispPage<MAX_PAGE)
+    if(dispPage<maxPage)
       drawIcon(icon_xpos[1], icon_ypos[1], (uint8_t*)clock_icon16x16, TFT_RED);
   } 
   
@@ -377,8 +364,8 @@ void buttons_test() {
       }
       if(timeToPwrOff<=0) {
         // play_tone(3000, 100, 1);
-        M5.setWakeupButton(BUTTON_C_PIN);
-        M5.powerOFF();
+        M5.Power.setWakeupButton(BUTTON_C_PIN);
+        M5.Power.powerOFF();
       }
       M5.update();
     }
@@ -387,7 +374,7 @@ void buttons_test() {
       drawIcon(246, 220, (uint8_t*)door_icon16x16, TFT_LIGHTGREY);
     } else {
       dispPage++;
-      if(dispPage>MAX_PAGE)
+      if(dispPage>maxPage)
         dispPage = 0;
       setPageIconPos(dispPage);
       M5.Lcd.clear(BLACK);
@@ -413,8 +400,14 @@ void wifi_connect() {
 
   // We start by connecting to a WiFi network
   for(int i=0; i<=9; i++) {
-    if((cfg.wlanssid[i][0]!=0) && (cfg.wlanpass[i][0]!=0))
-      WiFiMulti.addAP(cfg.wlanssid[i], cfg.wlanpass[i]);
+    if(cfg.wlanssid[i][0]!=0) {
+      if(cfg.wlanpass[i][0]==0) {
+        // no or empty password -> send NULL
+        WiFiMultiple.addAP(cfg.wlanssid[i], NULL);
+      } else {
+        WiFiMultiple.addAP(cfg.wlanssid[i], cfg.wlanpass[i]);
+      }
+    }
   }
 
   Serial.println();
@@ -422,7 +415,7 @@ void wifi_connect() {
   Serial.print("Wait for WiFi... ");
   M5.Lcd.print("Wait for WiFi... ");
 
-  while(WiFiMulti.run() != WL_CONNECTED) {
+  while(WiFiMultiple.run() != WL_CONNECTED) {
       Serial.print(".");
       M5.Lcd.print(".");
       delay(500);
@@ -488,147 +481,6 @@ int8_t getBatteryLevel()
     }
   }
   return -1;
-}
-
-// the setup routine runs once when M5Stack starts up
-void setup() {
-    // initialize the M5Stack object
-    M5.begin();
-    // prevent button A "ghost" random presses
-    Wire.begin();
-    SD.begin();
-    
-    // M5.Speaker.mute();
-
-    // Lcd display
-    M5.Lcd.setBrightness(100);
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.setTextSize(2);
-    yield();
-
-    Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
-
-    uint8_t cardType = SD.cardType();
-
-    if(cardType == CARD_NONE){
-        Serial.println("No SD card attached");
-        M5.Lcd.println("No SD card attached");
-        while(1);
-    }
-
-    Serial.print("SD Card Type: ");
-    M5.Lcd.print("SD Card Type: ");
-    if(cardType == CARD_MMC){
-        Serial.println("MMC");
-        M5.Lcd.println("MMC");
-    } else if(cardType == CARD_SD){
-        Serial.println("SDSC");
-        M5.Lcd.println("SDSC");
-    } else if(cardType == CARD_SDHC){
-        Serial.println("SDHC");
-        M5.Lcd.println("SDHC");
-    } else {
-        Serial.println("UNKNOWN");
-        M5.Lcd.println("UNKNOWN");
-    }
-
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-    Serial.printf("SD Card Size: %llu MB\n", cardSize);
-    M5.Lcd.printf("SD Card Size: %llu MB\n", cardSize);
-
-    readConfiguration(iniFilename, &cfg);
-    // strcpy(cfg.url, "https://sugarmate.io/api/v1/xxxxxx/latest.json");
-    // strcpy(cfg.url, "user.herokuapp.com"); 
-    // cfg.dev_mode = 1;
-    // cfg.show_mgdl = 1;
-    // cfg.sgv_only = 1;
-    // cfg.default_page = 2;
-    // strcpy(cfg.restart_at_time, "21:59");
-    // cfg.restart_at_logged_errors=3;
-    // cfg.show_COB_IOB = 0;
-    // cfg.snd_warning = 5.5;
-    // cfg.snd_alarm = 4.5;
-    // cfg.snd_warning_high = 9;
-    // cfg.snd_alarm_high = 14;
-    // cfg.alarm_volume = 0;
-    // cfg.warning_volume = 0;
-    // cfg.snd_warning_at_startup = 1;
-    // cfg.snd_alarm_at_startup = 1;
-  
-    // cfg.alarm_repeat = 1;
-    // cfg.snooze_timeout = 2;
-    // cfg.brightness1 = 0;
-    // cfg.temperature_unit = 3;
-    // cfg.date_format = 1;
-    // cfg.display_rotation = 7;
-    // cfg.invert_display = 1;
-    // cfg.info_line = 1;
-
-    if(cfg.invert_display != -1) {
-      M5.Lcd.invertDisplay(cfg.invert_display);
-      Serial.print("Calling M5.Lcd.invertDisplay("); Serial.print(cfg.invert_display); Serial.println(")");
-    } else {
-      Serial.println("No invert_display defined in INI.");
-    }
-    M5.Lcd.setRotation(cfg.display_rotation);
-    lcdBrightness = cfg.brightness1;
-    M5.Lcd.setBrightness(lcdBrightness);
-    
-    startupLogo();
-    yield();
-
-    preferences.begin("M5StackNS", false);
-    if(preferences.getBool("SoftReset", false)) {
-      // no startup sound after soft reset and remove the SoftReset key
-      lastSnoozeTime=preferences.getUInt("LastSnoozeTime", 0);
-      preferences.remove("SoftReset");
-      preferences.remove("LastSnoozeTime");
-    } else {
-      // normal startup so decide by M5NS.INI if to play startup sound
-      if(cfg.snd_warning_at_startup) {
-        play_tone(3000, 100, cfg.warning_volume);
-        delay(500);
-      }
-      if(cfg.snd_alarm_at_startup) {
-        play_tone(660, 400, cfg.alarm_volume);
-        delay(500);
-      }
-    }
-    preferences.end();
-
-    delay(1000);
-    M5.Lcd.fillScreen(BLACK);
-
-    M5.Lcd.setBrightness(lcdBrightness);
-    wifi_connect();
-    yield();
-
-    M5.Lcd.setBrightness(lcdBrightness);
-    M5.Lcd.fillScreen(BLACK);
-    
-    // fill dummy values to error log
-    /*
-    for(int i=0; i<10; i++) {
-      getLocalTime(&err_log[i].err_time);
-      err_log[i].err_code=404;
-    }
-    getLocalTime(&err_log[6].err_time);
-    err_log[6].err_code=HTTPC_ERROR_CONNECTION_REFUSED;
-    err_log_ptr=10;
-    err_log_count=23;
-    */
-    
-    // test file with time stamps
-    // msCountLog = millis()-6000;
-
-    dispPage = cfg.default_page;
-    setPageIconPos(dispPage);
-    // stat startup time
-    msStart = millis();
-    // update glycemia now
-    msCount = msStart-16000;
 }
 
 void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color){
@@ -710,7 +562,7 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
   int err=0;
   char tmpstr[32];
   
-  if((WiFiMulti.run() == WL_CONNECTED)) {
+  if((WiFiMultiple.run() == WL_CONNECTED)) {
     // configure target server and url
     if(strncmp(url, "http", 4))
       strcpy(NSurl,"https://");
@@ -739,17 +591,17 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
     M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
     drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi2_icon16x16, TFT_BLUE);
     
-    Serial.print("JSON query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
+    Serial.print("JSON query NSurl = \'");Serial.print(NSurl);Serial.print("\'\r\n");
     http.begin(NSurl); //HTTP
     
-    Serial.print("[HTTP] GET...\n");
+    Serial.print("[HTTP] GET...\r\n");
     // start connection and send HTTP header
     int httpCode = http.GET();
   
     // httpCode will be negative on error
     if(httpCode > 0) {
       // HTTP header has been send and Server response header has been handled
-      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+      Serial.printf("[HTTP] GET... code: %d\r\n", httpCode);
 
       // file found at server
       if(httpCode == HTTP_CODE_OK) {
@@ -769,6 +621,24 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
         // Serial.println(json);
         // const size_t capacity = JSON_ARRAY_SIZE(10) + 10*JSON_OBJECT_SIZE(19) + 3840;
         // Serial.print("JSON size needed= "); Serial.print(capacity); 
+        int ndx=0;
+        int sr=json.indexOf("\"date\":", ndx);
+        while(sr!=-1) {
+          ndx=sr+1;
+          if(sr+20<json.length()) {
+            // Serial.printf("Found date at position %d with char '%c' at +20\r\n", sr, json.charAt(sr+20));
+            if(json.charAt(sr+20)=='.') {
+              Serial.printf("Deleting at postion %d char '%c'\r\n", sr+20, json.charAt(sr+20));
+              json.remove(sr+20,1);
+              while(sr+20<json.length() && json.charAt(sr+20)>='0' && json.charAt(sr+20)<='9') {
+                Serial.printf("Cyclus deleting at postition %d char '%c'\r\n", sr+20, json.charAt(sr+20));
+                json.remove(sr+20,1);
+              }
+            }
+          }
+          sr=json.indexOf("\"date\":", ndx);
+        }
+        // Serial.println(json);
         Serial.print("Free Heap = "); Serial.println(ESP.getFreeHeap());
         DeserializationError JSONerr = deserializeJson(JSONdoc, json);
         Serial.println("JSON deserialized OK");
@@ -796,6 +666,17 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
               sgvindex=0;
             strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
             ns->is_xDrip = obj.containsKey("xDrip_raw");
+            /*
+            JsonVariant answer = JSONdoc[sgvindex]["date"];
+            const char* s = answer.as<char*>(); 
+            if(s!=NULL)
+              strlcpy(tmpstr, s, 32);
+            else
+              tmpstr[0]=0;
+            Serial.printf("DATE string: %s\r\n", tmpstr);
+            double LD=answer; 
+            Serial.printf("DATE double: %lf\r\n", LD);
+            */
             ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
             ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
             strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
@@ -811,7 +692,7 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
             ns->sensSgv = JSONdoc["value"]; // get value of sensor measurement
             time_t tmptime = JSONdoc["x"]; // time in milliseconds since 1970
             if(ns->sensTime != tmptime) {
-              for(int i=9; i>=0; i--) { // add new value and shift buffer
+              for(int i=9; i>0; i--) { // add new value and shift buffer
                ns->last10sgv[i]=ns->last10sgv[i-1];
               }
               ns->last10sgv[0] = ns->sensSgv;
@@ -889,7 +770,7 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
     http.end();
 
     if(err!=0) {
-      Serial.printf("Returnining with error %d\n",err);
+      Serial.printf("Returnining with error %d\r\n",err);
       return err;
     }
       
@@ -903,21 +784,31 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
     else
       strcpy(NSurl,"");
     strcat(NSurl,url);
-    strcat(NSurl,"/api/v2/properties/iob,cob,delta,loop,basal");
+    switch(cfg.info_line) {
+      case 2:
+        strcat(NSurl,"/api/v2/properties/iob,cob,delta,loop,basal");
+        break;
+      case 3:
+        strcat(NSurl,"/api/v2/properties/iob,cob,delta,openaps,basal");
+        break;
+      default:
+        strcat(NSurl,"/api/v2/properties/iob,cob,delta,basal");
+    }
+    
     if (strlen(token) > 0){
-      strcat(NSurl,"&token=");
+      strcat(NSurl,"?token=");
       strcat(NSurl,token);
     }
     
     M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
     drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi1_icon16x16, TFT_BLUE);
 
-    Serial.print("Properties query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
+    Serial.print("Properties query NSurl = \'");Serial.print(NSurl);Serial.print("\'\r\n");
     http.begin(NSurl); //HTTP
-    Serial.print("[HTTP] GET properties...\n");
+    Serial.print("[HTTP] GET properties...\r\n");
     httpCode = http.GET();
     if(httpCode > 0) {
-      Serial.printf("[HTTP] GET properties... code: %d\n", httpCode);
+      Serial.printf("[HTTP] GET properties... code: %d\r\n", httpCode);
       if(httpCode == HTTP_CODE_OK) {
         // const char* propjson = "{\"iob\":{\"iob\":0,\"activity\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"display\":\"0\",\"displayLine\":\"IOB: 0U\"},\"cob\":{\"cob\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"treatmentCOB\":{\"decayedBy\":\"2019-05-11T23:05:00.000Z\",\"isDecaying\":0,\"carbs_hr\":20,\"rawCarbImpact\":0,\"cob\":7,\"lastCarbs\":{\"_id\":\"5cd74c26156712edb4b32455\",\"enteredBy\":\"Martin\",\"eventType\":\"Carb Correction\",\"reason\":\"\",\"carbs\":7,\"duration\":0,\"created_at\":\"2019-05-11T22:24:00.000Z\",\"mills\":1557613440000,\"mgdl\":67}},\"display\":0,\"displayLine\":\"COB: 0g\"},\"delta\":{\"absolute\":-4,\"elapsedMins\":4.999483333333333,\"interpolated\":false,\"mean5MinsAgo\":69,\"mgdl\":-4,\"scaled\":-0.2,\"display\":\"-0.2\",\"previous\":{\"mean\":69,\"last\":69,\"mills\":1557613221946,\"sgvs\":[{\"mgdl\":69,\"mills\":1557613221946,\"device\":\"MIAOMIAO\",\"direction\":\"Flat\",\"filtered\":92588,\"unfiltered\":92588,\"noise\":1,\"rssi\":100}]}}}";
         String propjson = http.getString();
@@ -961,8 +852,15 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
           strncpy(ns->delta_display, delta["display"] | "", 16); // "-0.2"
           // Serial.println("DELTA OK");
           
-          JsonObject loop_obj = JSONdoc["loop"];
-          JsonObject loop_display = loop_obj["display"];
+          JsonObject loop_obj;
+          JsonObject loop_display;
+          if(cfg.info_line==3) {
+            loop_obj = JSONdoc["openaps"];
+            loop_display = loop_obj["status"];
+          } else {
+            loop_obj = JSONdoc["loop"];
+            loop_display = loop_obj["display"];
+          }
           strncpy(tmpstr, loop_display["symbol"] | "?", 4); // "⌁"
           ns->loop_display_symbol = tmpstr[0];
           strncpy(ns->loop_display_code, loop_display["code"] | "N/A", 16); // "enacted"
@@ -1001,7 +899,7 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
 
 void drawBatteryStatus(int16_t x, int16_t y) {
   int8_t battLevel = getBatteryLevel();
-  Serial.print("Battery level: "); Serial.println(battLevel);
+  // Serial.print("Battery level: "); Serial.println(battLevel);
   M5.Lcd.fillRect(x, y, 16, 17, TFT_BLACK);
   if(battLevel!=-1) {
     switch(battLevel) {
@@ -1047,11 +945,11 @@ void handleAlarmsInfoLine(struct NSinfo *ns) {
   M5.Lcd.setTextDatum(TL_DATUM);
   if( snoozeDifSec<cfg.snooze_timeout*60 ) {
     sprintf(tmpStr, "%i", (cfg.snooze_timeout*60-snoozeDifSec+59)/60);
-    if(dispPage<MAX_PAGE)
+    if(dispPage<maxPage)
       drawIcon(icon_xpos[1], icon_ypos[1], (uint8_t*)clock_icon16x16, TFT_RED);
   } else {
     strcpy(tmpStr, "Snooze");
-    if(dispPage<MAX_PAGE)
+    if(dispPage<maxPage)
       M5.Lcd.fillRect(icon_xpos[1], icon_ypos[1], 16, 16, BLACK);
   }
   M5.Lcd.setTextSize(1);
@@ -1148,6 +1046,7 @@ void handleAlarmsInfoLine(struct NSinfo *ns) {
                 drawIcon(246, 220, (uint8_t*)door_icon16x16, TFT_LIGHTGREY);
                 break;
               case 2: // loop + basal information
+              case 3: // openaps + basal information
                 strcpy(infoStr, "L: ");
                 strlcat(infoStr, ns->loop_display_label, 64);
                 M5.Lcd.drawString(infoStr, 0, 220, GFXFF);
@@ -1266,7 +1165,7 @@ void draw_page() {
           M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
         else
           M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        Serial.print("ns.iob_displayLine=\""); Serial.print(ns.iob_displayLine); Serial.println("\"");
+        // Serial.print("ns.iob_displayLine=\""); Serial.print(ns.iob_displayLine); Serial.println("\"");
         strncpy(tmpstr, ns.iob_displayLine, 16);
         if(strncmp(tmpstr, "IOB:", 4)==0) {
           strcpy(tmpstr,"I");
@@ -1277,7 +1176,7 @@ void draw_page() {
           M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
         else
           M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        Serial.print("ns.cob_displayLine=\""); Serial.print(ns.cob_displayLine); Serial.println("\"");
+        // Serial.print("ns.cob_displayLine=\""); Serial.print(ns.cob_displayLine); Serial.println("\"");
         strncpy(tmpstr, ns.cob_displayLine, 16);
         if(strncmp(tmpstr, "COB:", 4)==0) {
           strcpy(tmpstr,"C");
@@ -1373,7 +1272,7 @@ void draw_page() {
         M5.Lcd.drawString(sensSgvStr, 0, 120, GFXFF);
       }
       int tw=M5.Lcd.textWidth(sensSgvStr);
-      int th=M5.Lcd.fontHeight(GFXFF);
+      // int th=M5.Lcd.fontHeight(GFXFF);
       // Serial.print("textWidth="); Serial.println(tw);
       // Serial.print("textHeight="); Serial.println(th);
     
@@ -1417,7 +1316,7 @@ void draw_page() {
       M5.Lcd.setTextDatum(MC_DATUM);
       M5.Lcd.setTextColor(glColor, TFT_BLACK);
       char sensSgvStr[30];
-      int smaller_font = 0;
+      // int smaller_font = 0;
       if( cfg.show_mgdl ) {
         if(ns.sensSgvMgDl<100) {
           sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
@@ -1497,7 +1396,7 @@ void draw_page() {
       M5.Lcd.setTextDatum(TL_DATUM);
       M5.Lcd.setTextColor(glColor, TFT_BLACK);
       char sensSgvStr[30];
-      int smaller_font = 0;
+      // int smaller_font = 0;
       if( cfg.show_mgdl ) {
         if(ns.sensSgvMgDl<100) {
           sprintf(sensSgvStr, "%2.0f", ns.sensSgvMgDl);
@@ -1735,7 +1634,10 @@ void draw_page() {
         M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         M5.Lcd.drawString("no errors in log", 0, 20, GFXFF);
       } else {
-        for(int i=0; i<err_log_ptr; i++) {
+        int maxErrDisp = err_log_ptr;
+        if(maxErrDisp>8)
+          maxErrDisp = 8;
+        for(int i=0; i<maxErrDisp; i++) {
           M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
           sprintf(tmpStr, "%02d.%02d.%02d:%02d", err_log[i].err_time.tm_mday, err_log[i].err_time.tm_mon+1, err_log[i].err_time.tm_hour, err_log[i].err_time.tm_min);
           M5.Lcd.drawString(tmpStr, 0, 20+i*18, GFXFF);
@@ -1765,6 +1667,14 @@ void draw_page() {
         sprintf(tmpStr, "Total errors %d", err_log_count);
         M5.Lcd.drawString(tmpStr, 0, 20+err_log_ptr*18, GFXFF);
       }
+      IPAddress ip = WiFi.localIP();
+      if(mDNSactive)
+        sprintf(tmpStr, "%s.local (%u.%u.%u.%u)", cfg.deviceName, ip[0], ip[1], ip[2], ip[3]);
+      else
+        sprintf(tmpStr, "IP Address: %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+      M5.Lcd.drawString(tmpStr, 0, 20+9*18, GFXFF);
+      sprintf(tmpStr, "Version: %s", M5NSversion.c_str());
+      M5.Lcd.drawString(tmpStr, 0, 20+10*18, GFXFF);
       handleAlarmsInfoLine(&ns);
       drawBatteryStatus(icon_xpos[2], icon_ypos[2]);
       drawLogWarningIcon();
@@ -1773,8 +1683,173 @@ void draw_page() {
   }
 }
 
+// the setup routine runs once when M5Stack starts up
+void setup() {
+    // initialize the M5Stack object
+    M5.begin();
+    // prevent button A "ghost" random presses
+    Wire.begin();
+    SD.begin();
+    
+    // M5.Speaker.mute();
+
+    // Lcd display
+    M5.Lcd.setBrightness(100);
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.setTextSize(2);
+    yield();
+
+    Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
+
+    uint8_t cardType = SD.cardType();
+
+    if(cardType == CARD_NONE){
+        Serial.println("No SD card attached");
+        M5.Lcd.println("No SD card attached");
+        while(1);
+    }
+
+    Serial.print("SD Card Type: ");
+    M5.Lcd.print("SD Card Type: ");
+    if(cardType == CARD_MMC){
+        Serial.println("MMC");
+        M5.Lcd.println("MMC");
+    } else if(cardType == CARD_SD){
+        Serial.println("SDSC");
+        M5.Lcd.println("SDSC");
+    } else if(cardType == CARD_SDHC){
+        Serial.println("SDHC");
+        M5.Lcd.println("SDHC");
+    } else {
+        Serial.println("UNKNOWN");
+        M5.Lcd.println("UNKNOWN");
+    }
+
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.printf("SD Card Size: %llu MB\r\n", cardSize);
+    M5.Lcd.printf("SD Card Size: %llu MB\r\n", cardSize);
+
+    readConfiguration(iniFilename, &cfg);
+    // strcpy(cfg.url, "https://sugarmate.io/api/v1/xxxxxx/latest.json");
+    // strcpy(cfg.url, "user.herokuapp.com"); 
+    // cfg.dev_mode = 1;
+    // cfg.show_mgdl = 1;
+    // cfg.sgv_only = 1;
+    // cfg.default_page = 2;
+    // strcpy(cfg.restart_at_time, "21:59");
+    // cfg.restart_at_logged_errors=3;
+    // cfg.show_COB_IOB = 0;
+    // cfg.snd_warning = 5.5;
+    // cfg.snd_alarm = 4.5;
+    // cfg.snd_warning_high = 9;
+    // cfg.snd_alarm_high = 14;
+    // cfg.alarm_volume = 0;
+    // cfg.warning_volume = 0;
+    // cfg.snd_warning_at_startup = 1;
+    // cfg.snd_alarm_at_startup = 1;
+  
+    // cfg.alarm_repeat = 1;
+    // cfg.snooze_timeout = 2;
+    // cfg.brightness1 = 0;
+    // cfg.temperature_unit = 3;
+    // cfg.date_format = 1;
+    // cfg.display_rotation = 7;
+    // cfg.invert_display = 1;
+    // cfg.info_line = 2;
+
+    if(cfg.invert_display != -1) {
+      M5.Lcd.invertDisplay(cfg.invert_display);
+      Serial.print("Calling M5.Lcd.invertDisplay("); Serial.print(cfg.invert_display); Serial.println(")");
+    } else {
+      Serial.println("No invert_display defined in INI.");
+    }
+    M5.Lcd.setRotation(cfg.display_rotation);
+    lcdBrightness = cfg.brightness1;
+    M5.Lcd.setBrightness(lcdBrightness);
+    
+    startupLogo();
+    yield();
+
+    preferences.begin("M5StackNS", false);
+    if(preferences.getBool("SoftReset", false)) {
+      // no startup sound after soft reset and remove the SoftReset key
+      lastSnoozeTime=preferences.getUInt("LastSnoozeTime", 0);
+      preferences.remove("SoftReset");
+      preferences.remove("LastSnoozeTime");
+    } else {
+      // normal startup so decide by M5NS.INI if to play startup sound
+      if(cfg.snd_warning_at_startup) {
+        play_tone(3000, 100, cfg.warning_volume);
+        delay(500);
+      }
+      if(cfg.snd_alarm_at_startup) {
+        play_tone(660, 400, cfg.alarm_volume);
+        delay(500);
+      }
+    }
+    preferences.end();
+
+    delay(1000);
+    M5.Lcd.fillScreen(BLACK);
+
+    M5.Lcd.setBrightness(lcdBrightness);
+    wifi_connect();
+    yield();
+
+    M5.Lcd.setBrightness(lcdBrightness);
+    M5.Lcd.fillScreen(BLACK);
+    
+    // fill dummy values to error log
+    /*
+    for(int i=0; i<10; i++) {
+      getLocalTime(&err_log[i].err_time);
+      err_log[i].err_code=404;
+    }
+    getLocalTime(&err_log[6].err_time);
+    err_log[6].err_code=HTTPC_ERROR_CONNECTION_REFUSED;
+    err_log_ptr=10;
+    err_log_count=23;
+    */
+
+    // start MDNS service and the internal web server
+    if (MDNS.begin(cfg.deviceName)) {
+      Serial.println("MDNS responder started OK.");
+      mDNSactive = true;
+    } else {
+      Serial.println("ERROR: Could not startMDNS responder.");
+      mDNSactive = false;
+    }
+    if(cfg.disable_web_server==0) {
+      w3srv.on("/", handleRoot);
+      w3srv.on("/update", handleUpdate);
+      w3srv.on("/savecfg", handleSaveConfig);
+      w3srv.on("/switch", handleSwitchConfig);
+      w3srv.on("/edititem", handleEditConfigItem);
+      w3srv.on("/getedititem", handleGetEditConfigItem);
+      w3srv.on("/inline", []() {
+        w3srv.send(200, "text/plain", "this is inline and works as well");
+      });
+      w3srv.onNotFound(handleNotFound);
+      w3srv.begin();
+    }
+    
+    // test file with time stamps
+    // msCountLog = millis()-6000;
+
+    dispPage = cfg.default_page;
+    setPageIconPos(dispPage);
+    // stat startup time
+    msStart = millis();
+    // update glycemia now
+    msCount = msStart-16000;
+}
+
 // the loop routine runs over and over again forever
 void loop(){
+  if(!cfg.disable_web_server)
+    w3srv.handleClient();
   delay(20);
   buttons_test();
 
@@ -1789,6 +1864,8 @@ void loop(){
     Serial.print("msCount = "); Serial.println(msCount);
   } else {
     if((cfg.restart_at_logged_errors>0) && (err_log_count>=cfg.restart_at_logged_errors)) {
+      Serial.println("Restarting on number of logged errors...");
+      delay(500);
       preferences.begin("M5StackNS", false);
       preferences.putBool("SoftReset", true);
       preferences.putUInt("LastSnoozeTime", lastSnoozeTime);
@@ -1801,6 +1878,8 @@ void loop(){
       sprintf(localTimeStr, "%02d:%02d", localTimeInfo.tm_hour, localTimeInfo.tm_min);
       // no soft restart less than a minute from last restart to prevent several restarts in the same minute
       if((millis()-msStart>60000) && (strcmp(cfg.restart_at_time, localTimeStr)==0)) {
+        Serial.println("Restarting on preset time...");
+        delay(500);
         preferences.begin("M5StackNS", false);
         preferences.putBool("SoftReset", true);
         preferences.putUInt("LastSnoozeTime", lastSnoozeTime);
